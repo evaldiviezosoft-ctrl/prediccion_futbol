@@ -1,0 +1,42 @@
+{
+  "SP1": {
+    "slug": "laliga",
+    "name": "LaLiga",
+    "country": "España",
+    "api_id": 140,
+    "rows": 1900,
+    "model_file": "models/SP1/model_bundle.joblib"
+  },
+  "E0": {
+    "slug": "premier_league",
+    "name": "Premier League",
+    "country": "Inglaterra",
+    "api_id": 39,
+    "rows": 1900,
+    "model_file": "models/E0/model_bundle.joblib"
+  },
+  "F1": {
+    "slug": "ligue_1",
+    "name": "Ligue 1",
+    "country": "Francia",
+    "api_id": 61,
+    "rows": 1678,
+    "model_file": "models/F1/model_bundle.joblib"
+  },
+  "D1": {
+    "slug": "bundesliga",
+    "name": "Bundesliga",
+    "country": "Alemania",
+    "api_id": 78,
+    "rows": 1530,
+    "model_file": "models/D1/model_bundle.joblib"
+  },
+  "I1": {
+    "slug": "serie_a",
+    "name": "Serie A",
+    "country": "Italia",
+    "api_id": 135,
+    "rows": 1900,
+    "model_file": "models/I1/model_bundle.joblib"
+  }
+}

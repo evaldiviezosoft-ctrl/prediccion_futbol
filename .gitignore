@@ -1,0 +1,26 @@
+# Secrets and local configuration
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Flutter / Dart
+.dart_tool/
+.flutter-plugins-dependencies
+build/
+android/local.properties
+
+# Editors and signing material
+.idea/
+.vscode/
+*.jks
+*.keystore
+
+# Supabase CLI local state
+supabase/.temp/

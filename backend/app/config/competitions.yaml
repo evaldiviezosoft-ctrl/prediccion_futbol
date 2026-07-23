@@ -1,0 +1,80 @@
+competitions:
+  - internal_code: premier_league
+    expected_name: Premier League
+    country: England
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: laliga
+    expected_name: La Liga
+    country: Spain
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: serie_a_italy
+    expected_name: Serie A
+    country: Italy
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: bundesliga
+    expected_name: Bundesliga
+    country: Germany
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: ligue_1
+    expected_name: Ligue 1
+    country: France
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: peru_liga_1
+    expected_name: Primera Division
+    aliases:
+      - Primera División
+      - Liga 1
+    country: Peru
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: brazil_serie_a
+    expected_name: Serie A
+    country: Brazil
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: argentina_liga_profesional
+    expected_name: Liga Profesional Argentina
+    aliases:
+      - Primera Division
+      - Primera División
+    country: Argentina
+    type: league
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: copa_libertadores
+    expected_name: CONMEBOL Libertadores
+    aliases:
+      - Copa Libertadores
+    country: World
+    type: cup
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: copa_sudamericana
+    expected_name: CONMEBOL Sudamericana
+    aliases:
+      - Copa Sudamericana
+    country: World
+    type: cup
+    enabled: true
+    resolved_api_league_id: null

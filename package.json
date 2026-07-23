@@ -1,0 +1,21 @@
+{
+  "name": "prediccion_futbol",
+  "version": "1.0.0",
+  "description": "Aplicación Flutter con un backend FastAPI que obtiene próximos partidos desde API-Football, ejecuta modelos locales de aprendizaje automático y publica el resultado en Supabase para que la app lo reciba en tiempo real.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/evaldiviezosoft-ctrl/prediccion_futbol.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/evaldiviezosoft-ctrl/prediccion_futbol/issues"
+  },
+  "homepage": "https://github.com/evaldiviezosoft-ctrl/prediccion_futbol#readme"
+}
