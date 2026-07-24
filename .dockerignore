@@ -1,0 +1,14 @@
+.git/
+.env
+.env.*
+**/.env
+**/.env.*
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+backend/tests/
+backend/scripts/
+prediccion_futbol/
+build/
+node_modules/
