@@ -8,6 +8,9 @@ from typing import Any
 from app.core.config import get_settings
 
 TEAM_ALIASES = {
+    'E0': {
+        'Manchester United': 'Man United',
+    },
     'SP1': {
         'Espanyol': 'Espanol',
         'RCD Espanyol': 'Espanol',
@@ -18,6 +21,9 @@ TEAM_ALIASES = {
         'Real Betis': 'Betis',
     },
     'D1': {
+        'FC St. Pauli': 'St Pauli',
+        'SC Freiburg': 'Freiburg',
+        'VfL Wolfsburg': 'Wolfsburg',
         'Bayern München': 'Bayern Munich',
         'Borussia Mönchengladbach': "M'gladbach",
     },

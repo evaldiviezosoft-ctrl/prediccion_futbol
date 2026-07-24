@@ -7,6 +7,8 @@ void main() {
       'fixture_id': 1492292,
       'home_team_name': 'Chapecoense-SC',
       'away_team_name': 'Flamengo',
+      'home_team_country': 'Brazil',
+      'away_team_country': 'Brazil',
       'stage': 'prematch',
       'home_win_probability': 0.2,
       'draw_probability': 0.25,
@@ -37,6 +39,11 @@ void main() {
           'home_team_home_matches': 0,
           'away_team_away_matches': 57,
         },
+        'cross_league_calibration': {
+          'applied': true,
+          'home_source': {'competition_name': 'Eliteserien', 'factor': 0.91},
+          'away_source': {'competition_name': 'Premier League', 'factor': 1.08},
+        },
         'market_statistics': {
           'reference_statistics_league_id': 281,
           'teams': {
@@ -51,6 +58,8 @@ void main() {
     });
 
     expect(prediction.isStatisticalBaseline, isTrue);
+    expect(prediction.homeTeamCountry, 'Brazil');
+    expect(prediction.awayTeamCountry, 'Brazil');
     expect(prediction.homeVenueSample, 0);
     expect(prediction.awayVenueSample, 57);
     expect(prediction.expectedValue('home_goals'), 0.9);
@@ -62,5 +71,58 @@ void main() {
     expect(prediction.usesCrossLeagueStatisticsReference, isTrue);
     expect(prediction.statisticsReferenceRows, 41);
     expect(prediction.statisticsReferenceLeagueId, 281);
+    expect(prediction.crossLeagueCalibration?.homeCompetition, 'Eliteserien');
+    expect(prediction.crossLeagueCalibration?.homeFactor, 0.91);
+    expect(
+      prediction.crossLeagueCalibration?.awayCompetition,
+      'Premier League',
+    );
+    expect(prediction.crossLeagueCalibration?.awayFactor, 1.08);
+  });
+
+  test('Prediction reconoce un fallback marcado con confianza baja', () {
+    final prediction = Prediction.fromJson({
+      'fixture_id': 1,
+      'home_team_name': 'Barcelona',
+      'away_team_name': 'Europa FC',
+      'stage': 'orientative',
+      'home_win_probability': 0.5,
+      'draw_probability': 0.25,
+      'away_win_probability': 0.25,
+      'expected': {'home_corners': 5.0, 'away_corners': 4.2},
+      'updated_at': '2026-07-23T15:00:00Z',
+      'model_metadata': {
+        'model_type': 'calendar_fallback',
+        'confidence': 'low',
+        'single_team_profile': true,
+        'known_profile_sides': ['away'],
+      },
+    });
+
+    expect(prediction.isStatisticalBaseline, isFalse);
+    expect(prediction.isLowConfidenceFallback, isTrue);
+    expect(prediction.isSingleTeamProfileFallback, isTrue);
+    expect(prediction.knownProfileSides, {'away'});
+    expect(prediction.displayExpectedValue('home_corners'), isNull);
+    expect(prediction.displayExpectedValue('away_corners'), 4.2);
+    expect(prediction.crossLeagueCalibration, isNull);
+  });
+
+  test('Prediction omite una calibración no aplicada o incompleta', () {
+    const baseMetadata = <String, dynamic>{
+      'applied': false,
+      'home_source': {'competition_name': 'Eliteserien', 'factor': 0.91},
+      'away_source': {'competition_name': 'Premier League', 'factor': 1.08},
+    };
+
+    expect(CrossLeagueCalibration.tryParse(baseMetadata), isNull);
+    expect(
+      CrossLeagueCalibration.tryParse({
+        ...baseMetadata,
+        'applied': true,
+        'away_source': {'competition_name': 'Premier League'},
+      }),
+      isNull,
+    );
   });
 }

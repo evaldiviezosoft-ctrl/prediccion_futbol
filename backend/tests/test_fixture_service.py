@@ -15,13 +15,21 @@ def fixture_item(fixture_id: int, league_id: int = 39) -> dict:
             'id': fixture_id,
             'date': '2099-08-22T18:00:00+00:00',
             'timezone': 'UTC',
-            'venue': {'name': 'Test Stadium'},
+            'venue': {'id': 300, 'name': 'Test Stadium'},
             'status': {'short': 'NS'},
         },
         'league': {'id': league_id, 'season': 2099, 'round': 'Round 1'},
         'teams': {
-            'home': {'id': 10, 'name': 'Arsenal'},
-            'away': {'id': 20, 'name': 'Aston Villa'},
+            'home': {
+                'id': 10,
+                'name': 'Arsenal',
+                'logo': 'https://example.test/arsenal.png',
+            },
+            'away': {
+                'id': 20,
+                'name': 'Aston Villa',
+                'logo': 'https://example.test/villa.png',
+            },
         },
     }
 
@@ -45,6 +53,31 @@ class RecordingDb:
 
     def table(self, name):
         return RecordingTable(self, name)
+
+
+def competition(league_id: int, *, competition_id: int | None = None) -> dict:
+    return {
+        'id': competition_id or league_id,
+        'api_league_id': league_id,
+        'internal_code': f'league_{league_id}',
+        'name': f'League {league_id}',
+        'country': 'World',
+        'competition_type': 'cup' if league_id in {3, 667} else 'league',
+        'enabled': True,
+    }
+
+
+class RecordingRepository:
+    def __init__(self, competitions):
+        self.competitions = competitions
+        self.persisted = []
+
+    async def list_enabled_competitions(self):
+        return self.competitions
+
+    async def persist_fixtures_basic(self, fixtures, *, competition):
+        self.persisted.append((competition, list(fixtures)))
+        return {fixture.api_fixture_id: True for fixture in fixtures}
 
 
 class FixtureApi:
@@ -71,23 +104,85 @@ def test_fixture_payload_is_normalized():
     assert row['raw_payload']['fixture']['id'] == 123
 
 
-def test_sync_filters_unsupported_leagues_and_upserts_once():
+def test_sync_filters_unconfigured_leagues_and_persists_normalized_groups(monkeypatch):
     api = FixtureApi([
         fixture_item(1),
         fixture_item(2, league_id=281),
-        fixture_item(3, league_id=999),
+        fixture_item(3, league_id=3),
+        fixture_item(4, league_id=667),
+        fixture_item(5, league_id=999),
     ])
     db = RecordingDb()
+    repository = RecordingRepository([
+        competition(39),
+        competition(281),
+        competition(3),
+        competition(667),
+    ])
+    monkeypatch.setattr(
+        fixture_service,
+        'SupabaseRepository',
+        lambda *, client: repository,
+    )
 
     result = asyncio.run(
         sync_fixtures_by_date('2099-08-22', 'UTC', api_client=api, db_client=db)
     )
 
-    assert result.synced == 2
+    assert result.synced == 4
     assert result.rows[0]['id'] == 1
     assert result.rows[1]['league_id'] == 281
-    assert db.operations[0][0:2] == ('upsert', 'fixtures')
+    assert result.rows[2]['league_id'] == 3
+    assert result.rows[3]['league_id'] == 667
+    assert 3 not in fixture_service.SUPPORTED_LEAGUE_IDS
+    assert 667 not in fixture_service.SUPPORTED_LEAGUE_IDS
+    assert [group[0]['api_league_id'] for group in repository.persisted] == [
+        39,
+        281,
+        3,
+        667,
+    ]
+    first_fixture = repository.persisted[0][1][0]
+    assert first_fixture.fixture['api_fixture_id'] == 1
+    assert first_fixture.fixture['competition_id'] == 39
+    assert first_fixture.fixture['fixture_date_lima'] is not None
+    assert first_fixture.teams[0]['logo_url'] == 'https://example.test/arsenal.png'
+    assert first_fixture.teams[1]['logo_url'] == 'https://example.test/villa.png'
+    assert first_fixture.venue['api_venue_id'] == 300
+    assert db.operations == []
     assert api.closed is False
+
+
+def test_sync_safely_skips_a_syncable_but_unresolved_competition(monkeypatch):
+    api = FixtureApi([fixture_item(4, league_id=667)])
+    repository = RecordingRepository([
+        {
+            'id': 12,
+            'api_league_id': None,
+            'internal_code': 'friendlies_clubs',
+            'name': 'Friendlies Clubs',
+            'country': 'World',
+            'competition_type': 'cup',
+            'enabled': True,
+        },
+    ])
+    monkeypatch.setattr(
+        fixture_service,
+        'SupabaseRepository',
+        lambda *, client: repository,
+    )
+
+    result = asyncio.run(
+        sync_fixtures_by_date(
+            '2099-08-22',
+            'UTC',
+            api_client=api,
+            db_client=RecordingDb(),
+        )
+    )
+
+    assert result.synced == 0
+    assert repository.persisted == []
 
 
 def test_sync_rejects_an_invalid_timezone_before_calling_provider():
@@ -102,12 +197,12 @@ def test_sync_rejects_an_invalid_timezone_before_calling_provider():
 def test_default_sync_client_uses_request_log_sink_and_is_closed(monkeypatch):
     db = RecordingDb()
     api = FixtureApi([fixture_item(77)])
-    sink = object()
+    repository = RecordingRepository([competition(39)])
     captured = {}
 
     def repository_factory(*, client):
         assert client is db
-        return sink
+        return repository
 
     def api_factory(*, request_log_sink):
         captured['sink'] = request_log_sink
@@ -121,5 +216,6 @@ def test_default_sync_client_uses_request_log_sink_and_is_closed(monkeypatch):
     result = asyncio.run(sync_fixtures_by_date('2099-08-22', 'UTC'))
 
     assert result.synced == 1
-    assert captured['sink'] is sink
+    assert captured['sink'] is repository
+    assert len(repository.persisted) == 1
     assert api.closed is True

@@ -27,13 +27,13 @@ class _PredictionScreenState extends State<PredictionScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.fixture.predictionModelAvailable) {
+    if (widget.fixture.predictionAccessAvailable) {
       _stream = widget.repository.watchPrediction(widget.fixture.id);
     }
   }
 
   void _retry() {
-    if (!widget.fixture.predictionModelAvailable) return;
+    if (!widget.fixture.predictionAccessAvailable) return;
     setState(
       () => _stream = widget.repository.watchPrediction(widget.fixture.id),
     );
@@ -47,7 +47,7 @@ class _PredictionScreenState extends State<PredictionScreen> {
         alignment: Alignment.topCenter,
         child: ConstrainedBox(
           constraints: const BoxConstraints(maxWidth: 720),
-          child: !widget.fixture.predictionModelAvailable
+          child: !widget.fixture.predictionAccessAvailable
               ? const _PredictionState(
                   icon: Icons.model_training_outlined,
                   title: 'Modelo aún no disponible',
@@ -113,16 +113,30 @@ class _PredictionContent extends StatelessWidget {
           'home_shots_on_target',
           'away_shots_on_target',
         );
+    final isLowConfidenceFallback =
+        fixture.predictionFallbackAvailable ||
+        prediction.isLowConfidenceFallback;
+    final isSingleTeamFallback =
+        isLowConfidenceFallback && prediction.isSingleTeamProfileFallback;
 
     return ListView(
       padding: const EdgeInsets.only(bottom: 32),
       children: [
-        _MatchHeader(fixture: fixture),
-        _Section(
-          icon: Icons.bar_chart_rounded,
-          title: 'Predicción 1X2 (probabilidad)',
-          child: _ProbabilityPanel(prediction: prediction),
+        _MatchHeader(
+          fixture: fixture,
+          homeCountry: fixture.homeTeamCountry ?? prediction.homeTeamCountry,
+          awayCountry: fixture.awayTeamCountry ?? prediction.awayTeamCountry,
         ),
+        if (isLowConfidenceFallback)
+          _LowConfidenceFallbackNotice(
+            isSingleTeamProfile: isSingleTeamFallback,
+          ),
+        if (!isSingleTeamFallback)
+          _Section(
+            icon: Icons.bar_chart_rounded,
+            title: 'Predicción 1X2 (probabilidad)',
+            child: _ProbabilityPanel(prediction: prediction),
+          ),
         if (prediction.goalLines.isNotEmpty)
           _Section(
             icon: Icons.sports_soccer,
@@ -147,15 +161,15 @@ class _PredictionContent extends StatelessWidget {
                   _StatRow(
                     label: 'Córners',
                     icon: Icons.flag_outlined,
-                    home: prediction.expectedValue('home_corners'),
-                    away: prediction.expectedValue('away_corners'),
+                    home: prediction.displayExpectedValue('home_corners'),
+                    away: prediction.displayExpectedValue('away_corners'),
                   ),
                 if (_hasExpectedPair(prediction, 'home_shots', 'away_shots'))
                   _StatRow(
                     label: 'Remates',
                     icon: Icons.gps_fixed,
-                    home: prediction.expectedValue('home_shots'),
-                    away: prediction.expectedValue('away_shots'),
+                    home: prediction.displayExpectedValue('home_shots'),
+                    away: prediction.displayExpectedValue('away_shots'),
                   ),
                 if (_hasExpectedPair(
                   prediction,
@@ -165,8 +179,12 @@ class _PredictionContent extends StatelessWidget {
                   _StatRow(
                     label: 'Remates al arco',
                     icon: Icons.sports_soccer_outlined,
-                    home: prediction.expectedValue('home_shots_on_target'),
-                    away: prediction.expectedValue('away_shots_on_target'),
+                    home: prediction.displayExpectedValue(
+                      'home_shots_on_target',
+                    ),
+                    away: prediction.displayExpectedValue(
+                      'away_shots_on_target',
+                    ),
                   ),
                 if (prediction.isStatisticalBaseline) ...[
                   const SizedBox(height: 14),
@@ -176,7 +194,8 @@ class _PredictionContent extends StatelessWidget {
             ),
           ),
         if (prediction.possibleScorers.isNotEmpty ||
-            prediction.isStatisticalBaseline)
+            prediction.isStatisticalBaseline ||
+            isLowConfidenceFallback)
           _Section(
             icon: Icons.sports_soccer_outlined,
             title: 'Goleadores probables',
@@ -190,7 +209,8 @@ class _PredictionContent extends StatelessWidget {
                   ),
           ),
         if (prediction.possibleAssistants.isNotEmpty ||
-            prediction.isStatisticalBaseline)
+            prediction.isStatisticalBaseline ||
+            isLowConfidenceFallback)
           _Section(
             icon: Icons.assistant_outlined,
             title: 'Asistidores probables',
@@ -203,16 +223,79 @@ class _PredictionContent extends StatelessWidget {
                         .toList(),
                   ),
           ),
-        _StatusFooter(prediction: prediction),
+        _StatusFooter(
+          prediction: prediction,
+          isLowConfidenceFallback: isLowConfidenceFallback,
+        ),
       ],
     );
   }
 }
 
+class _LowConfidenceFallbackNotice extends StatelessWidget {
+  const _LowConfidenceFallbackNotice({required this.isSingleTeamProfile});
+
+  final bool isSingleTeamProfile;
+
+  @override
+  Widget build(BuildContext context) {
+    final message = isSingleTeamProfile
+        ? 'Baja confianza: solo uno de los equipos tiene historial; '
+              'no publicamos 1X2. Tómala solo como guía.'
+        : 'Baja confianza: usa datos parciales de los equipos y una '
+              'referencia general. Tómala solo como guía.';
+    return Container(
+      margin: const EdgeInsets.fromLTRB(20, 18, 20, 0),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppColors.amber.withValues(alpha: .08),
+        border: Border.all(color: AppColors.amber.withValues(alpha: .45)),
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(
+            Icons.warning_amber_rounded,
+            color: AppColors.amber,
+            size: 23,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Predicción orientativa',
+                  style: TextStyle(
+                    color: AppColors.amber,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 5),
+                Text(
+                  message,
+                  style: const TextStyle(color: AppColors.muted, height: 1.35),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _MatchHeader extends StatelessWidget {
-  const _MatchHeader({required this.fixture});
+  const _MatchHeader({
+    required this.fixture,
+    this.homeCountry,
+    this.awayCountry,
+  });
 
   final FixtureSummary fixture;
+  final String? homeCountry;
+  final String? awayCountry;
 
   @override
   Widget build(BuildContext context) {
@@ -249,6 +332,7 @@ class _MatchHeader extends StatelessWidget {
               Expanded(
                 child: _HeaderTeam(
                   team: fixture.homeTeam,
+                  country: homeCountry,
                   logoUrl: fixture.homeTeamLogoUrl,
                 ),
               ),
@@ -265,6 +349,7 @@ class _MatchHeader extends StatelessWidget {
               Expanded(
                 child: _HeaderTeam(
                   team: fixture.awayTeam,
+                  country: awayCountry,
                   logoUrl: fixture.awayTeamLogoUrl,
                 ),
               ),
@@ -277,9 +362,10 @@ class _MatchHeader extends StatelessWidget {
 }
 
 class _HeaderTeam extends StatelessWidget {
-  const _HeaderTeam({required this.team, this.logoUrl});
+  const _HeaderTeam({required this.team, this.country, this.logoUrl});
 
   final String team;
+  final String? country;
   final String? logoUrl;
 
   @override
@@ -299,6 +385,20 @@ class _HeaderTeam extends StatelessWidget {
             fontWeight: FontWeight.w800,
           ),
         ),
+        if (country != null) ...[
+          const SizedBox(height: 5),
+          Text(
+            country!,
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.muted,
+              fontSize: 12,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -776,12 +876,17 @@ class _StatisticsSourceNotice extends StatelessWidget {
 }
 
 class _StatusFooter extends StatelessWidget {
-  const _StatusFooter({required this.prediction});
+  const _StatusFooter({
+    required this.prediction,
+    required this.isLowConfidenceFallback,
+  });
 
   final Prediction prediction;
+  final bool isLowConfidenceFallback;
 
   @override
   Widget build(BuildContext context) {
+    final crossLeagueCalibration = prediction.crossLeagueCalibration;
     return Padding(
       padding: const EdgeInsets.fromLTRB(20, 24, 20, 8),
       child: Column(
@@ -798,7 +903,32 @@ class _StatusFooter extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 13),
-          if (prediction.isStatisticalBaseline) ...[
+          if (isLowConfidenceFallback) ...[
+            const Row(
+              children: [
+                Icon(
+                  Icons.warning_amber_rounded,
+                  color: AppColors.amber,
+                  size: 22,
+                ),
+                SizedBox(width: 9),
+                Expanded(
+                  child: Text(
+                    'Predicción orientativa • baja confianza',
+                    style: TextStyle(
+                      color: AppColors.amber,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              'No es un modelo validado para esta competición y no garantiza resultados.',
+              style: TextStyle(color: AppColors.muted, fontSize: 13),
+            ),
+          ] else if (prediction.isStatisticalBaseline) ...[
             const Row(
               children: [
                 Icon(
@@ -860,6 +990,65 @@ class _StatusFooter extends StatelessWidget {
                 ),
               ],
             ),
+          if (crossLeagueCalibration != null) ...[
+            const SizedBox(height: 14),
+            _CrossLeagueCalibrationNote(calibration: crossLeagueCalibration),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _CrossLeagueCalibrationNote extends StatelessWidget {
+  const _CrossLeagueCalibrationNote({required this.calibration});
+
+  final CrossLeagueCalibration calibration;
+
+  @override
+  Widget build(BuildContext context) {
+    final factors =
+        '${calibration.homeCompetition} '
+        '${calibration.homeFactor.toStringAsFixed(2)} · '
+        '${calibration.awayCompetition} '
+        '${calibration.awayFactor.toStringAsFixed(2)}';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Icon(Icons.tune_rounded, color: AppColors.primary, size: 20),
+          const SizedBox(width: 9),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text(
+                  'Calibración orientativa por competición',
+                  style: TextStyle(
+                    color: AppColors.text,
+                    fontSize: 13,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '$factors — factores de contexto, no probabilidades.',
+                  style: const TextStyle(
+                    color: AppColors.muted,
+                    fontSize: 12,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ],
       ),
     );
@@ -921,8 +1110,8 @@ class _PredictionState extends StatelessWidget {
 String _percent(double value) => '${(value * 100).round()}%';
 
 bool _hasExpectedPair(Prediction prediction, String homeKey, String awayKey) =>
-    prediction.expectedValue(homeKey) != null ||
-    prediction.expectedValue(awayKey) != null;
+    prediction.displayExpectedValue(homeKey) != null ||
+    prediction.displayExpectedValue(awayKey) != null;
 
 String _number(double? value) => value == null ? '—' : value.toStringAsFixed(1);
 

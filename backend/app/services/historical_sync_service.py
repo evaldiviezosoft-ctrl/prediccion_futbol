@@ -5,8 +5,10 @@ import logging
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.core.errors import ProviderAccessRestrictionError, ProviderRateLimitError
+from app.services.baseline_model_service import BASELINE_FINAL_STATUSES
 from app.services.fixture_normalizer import (
     FixtureNormalizationError,
+    NormalizedFixture,
     normalize_fixture,
 )
 from app.services.supabase_repository import SupabaseRepository
@@ -14,6 +16,9 @@ from app.services.supabase_repository import SupabaseRepository
 
 logger = logging.getLogger(__name__)
 MAX_FIXTURE_IDS_PER_REQUEST = 20
+MAX_TEAM_BACKFILL_TARGETS = 25
+MAX_TEAM_HISTORY_FIXTURES = 100
+MAX_TEAM_DETAIL_FIXTURES = 500
 
 
 class HistoricalApiClient(Protocol):
@@ -30,6 +35,18 @@ class HistoricalApiClient(Protocol):
         date_to: str | None = None,
     ) -> list[dict[str, Any]]: ...
 
+    async def fixtures_for_team(
+        self,
+        team: int,
+        *,
+        last: int | None = None,
+        season: int | None = None,
+        status: str | None = None,
+        timezone_name: str | None = None,
+    ) -> list[dict[str, Any]]: ...
+
+    async def team_by_id(self, team: int) -> dict[str, Any] | None: ...
+
     async def fixture_details(
         self,
         ids: Sequence[int],
@@ -42,8 +59,15 @@ class SyncSummary:
     competitions_processed: int = 0
     seasons_available: int = 0
     seasons_unavailable: int = 0
+    teams_requested: int = 0
+    teams_processed: int = 0
+    team_metadata_updated: int = 0
+    fixtures_discovered: int = 0
+    fixtures_deduplicated: int = 0
+    fixtures_skipped: int = 0
     fixtures_downloaded: int = 0
     fixtures_updated: int = 0
+    details_skipped_existing: int = 0
     details_complete: int = 0
     details_incomplete: int = 0
     optional_downloaded: int = 0
@@ -175,6 +199,294 @@ class HistoricalSyncService:
                 _update_rate_summary(summary, self.client)
                 if stopped:
                     return summary
+        return summary
+
+    async def backfill_team_history(
+        self,
+        *,
+        team_ids: Sequence[int],
+        max_fixtures_per_team: int = 20,
+        max_detail_fixtures: int = 20,
+        force_singular_details: bool = False,
+        season: int | None = None,
+    ) -> SyncSummary:
+        """Seed missing club history without downloading complete leagues.
+
+        Each unique team costs one bounded `/fixtures?team=...&last=...`
+        request. Only completed competitive matches with a score are stored.
+        A domestic league missing from the global catalog gets a disabled,
+        deterministic `api_<id>` competition row; this permits normalized
+        storage without enabling a future full-league download. Detail calls
+        are restricted to recent fixtures that do not already have normalized
+        team statistics. The aggregate response may contain player rows, but
+        this method never calls a player-specific endpoint.
+        """
+
+        unique_team_ids = _validated_team_ids(team_ids)
+        if not 1 <= max_fixtures_per_team <= MAX_TEAM_HISTORY_FIXTURES:
+            raise ValueError(
+                f'max_fixtures_per_team must be between 1 and '
+                f'{MAX_TEAM_HISTORY_FIXTURES}.'
+            )
+        if not 0 <= max_detail_fixtures <= MAX_TEAM_DETAIL_FIXTURES:
+            raise ValueError(
+                f'max_detail_fixtures must be between 0 and '
+                f'{MAX_TEAM_DETAIL_FIXTURES}.'
+            )
+        if season is not None and not 2000 <= season <= 2100:
+            raise ValueError('season must be between 2000 and 2100.')
+
+        summary = SyncSummary(teams_requested=len(unique_team_ids))
+        competitions_by_league: dict[int, Mapping[str, Any]] = {}
+        fixtures_by_id: dict[
+            int, tuple[NormalizedFixture, Mapping[str, Any]]
+        ] = {}
+        processed_competition_ids: set[int] = set()
+        for team_id in unique_team_ids:
+            try:
+                history_query: dict[str, Any] = {
+                    'timezone_name': self.timezone,
+                }
+                if season is None:
+                    history_query['last'] = max_fixtures_per_team
+                else:
+                    history_query['season'] = season
+                fixture_items = await self.client.fixtures_for_team(
+                    team_id,
+                    **history_query,
+                )
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    self._stop_for_limit(summary, exc)
+                    return summary
+                summary.errors += 1
+                logger.exception('Team history request failed for team %s.', team_id)
+                summary.messages.append(
+                    f'[equipo {team_id}] no se pudo descargar el historial: '
+                    f'{type(exc).__name__}'
+                )
+                continue
+
+            summary.teams_processed += 1
+            summary.fixtures_discovered += len(fixture_items)
+            if season is not None:
+                fixture_items = sorted(
+                    fixture_items,
+                    key=_raw_team_fixture_sort_key,
+                    reverse=True,
+                )
+            grouped: dict[int, list[NormalizedFixture]] = {}
+            competition_for_group: dict[int, Mapping[str, Any]] = {}
+            selected_for_team = 0
+            for item in fixture_items:
+                if not _is_usable_raw_team_history_fixture(item, team_id):
+                    summary.fixtures_skipped += 1
+                    continue
+                if season is not None and selected_for_team >= max_fixtures_per_team:
+                    summary.fixtures_skipped += 1
+                    continue
+                league_id = _provider_league_id_or_none(item)
+                league = item.get('league')
+                if (
+                    league_id is None
+                    or not isinstance(league, Mapping)
+                    or _is_noncompetitive_league(league)
+                ):
+                    summary.fixtures_skipped += 1
+                    continue
+                competition = competitions_by_league.get(league_id)
+                if competition is None:
+                    try:
+                        competition = (
+                            await self.repository.ensure_targeted_competition(
+                                league
+                            )
+                        )
+                    except Exception:
+                        summary.errors += 1
+                        summary.fixtures_skipped += 1
+                        logger.exception(
+                            'Could not resolve targeted competition %s.',
+                            league_id,
+                        )
+                        continue
+                    competitions_by_league[league_id] = competition
+                try:
+                    normalized = normalize_fixture(
+                        item,
+                        competition_id=int(competition['id']),
+                    )
+                except FixtureNormalizationError as exc:
+                    summary.errors += 1
+                    summary.fixtures_skipped += 1
+                    logger.warning(
+                        'Skipped invalid team fixture for team %s: %s',
+                        team_id,
+                        exc,
+                    )
+                    continue
+                if not _is_usable_team_history_fixture(normalized, team_id):
+                    summary.fixtures_skipped += 1
+                    continue
+                selected_for_team += 1
+                fixture_id = normalized.api_fixture_id
+                if fixture_id in fixtures_by_id:
+                    summary.fixtures_deduplicated += 1
+                    continue
+                fixtures_by_id[fixture_id] = (normalized, competition)
+                competition_id = int(competition['id'])
+                grouped.setdefault(competition_id, []).append(normalized)
+                competition_for_group[competition_id] = competition
+
+            for competition_id, normalized_group in grouped.items():
+                competition = competition_for_group[competition_id]
+                persisted = await self.repository.persist_fixtures_basic(
+                    normalized_group,
+                    competition=competition,
+                )
+                summary.fixtures_downloaded += len(normalized_group)
+                summary.fixtures_updated += sum(persisted.values())
+                processed_competition_ids.add(competition_id)
+            summary.competitions_processed = len(processed_competition_ids)
+            summary.messages.append(
+                f'[equipo {team_id}] {len(fixture_items)} encontrados; '
+                f'{sum(len(group) for group in grouped.values())} elegibles nuevos.'
+            )
+            _update_rate_summary(summary, self.client)
+
+        summary.competitions_processed = len(processed_competition_ids)
+        if not fixtures_by_id:
+            summary.messages.append(
+                'No se encontraron resultados finales utilizables en ligas competitivas.'
+            )
+            return summary
+        if max_detail_fixtures == 0:
+            summary.messages.append(
+                'Se guardaron fixtures básicos; el límite de detalles es cero.'
+            )
+            return summary
+
+        completed_statistics = (
+            await self.repository.fixture_ids_with_team_statistics(
+                list(fixtures_by_id)
+            )
+        )
+        summary.details_skipped_existing = len(
+            set(fixtures_by_id) & completed_statistics
+        )
+        pending = [
+            value
+            for fixture_id, value in fixtures_by_id.items()
+            if fixture_id not in completed_statistics
+        ]
+        pending.sort(
+            key=lambda value: _team_fixture_sort_key(value[0]),
+            reverse=True,
+        )
+        selected = pending[:max_detail_fixtures]
+        if len(pending) > len(selected):
+            summary.messages.append(
+                f'Detalles acotados a {len(selected)} de {len(pending)} fixtures '
+                'pendientes, priorizando los más recientes.'
+            )
+        if not selected:
+            summary.messages.append(
+                'Todos los fixtures elegibles ya tienen estadísticas de equipo.'
+            )
+            return summary
+
+        target_map = {
+            int(competition['id']): competition
+            for _, competition in selected
+        }
+        coverage_by_season: dict[tuple[int, int], Mapping[str, Any]] = {}
+        for competition_id in target_map:
+            season_rows = await self.repository.list_competition_seasons(
+                competition_id
+            )
+            for season_row in season_rows:
+                coverage_by_season[
+                    (competition_id, int(season_row['season']))
+                ] = season_row.get('coverage_json') or {}
+
+        detail_rows = [
+            {
+                'competition_id': int(competition['id']),
+                'season': int(normalized.fixture['season']),
+                'api_fixture_id': normalized.api_fixture_id,
+            }
+            for normalized, competition in selected
+        ]
+        for batch in _chunks_by_competition(detail_rows):
+            competition_id = int(batch[0]['competition_id'])
+            competition = target_map[competition_id]
+            fixture_ids = [int(row['api_fixture_id']) for row in batch]
+            seasons = {
+                int(row['api_fixture_id']): int(row['season'])
+                for row in batch
+            }
+            stopped = await self._sync_detail_ids(
+                competition=competition,
+                fixture_ids=fixture_ids,
+                seasons=seasons,
+                coverage_by_fixture={
+                    fixture_id: coverage_by_season.get(
+                        (competition_id, season),
+                        {},
+                    )
+                    for fixture_id, season in seasons.items()
+                },
+                summary=summary,
+                required_components=frozenset({'statistics'}),
+                force_singular=force_singular_details,
+            )
+            _update_rate_summary(summary, self.client)
+            if stopped:
+                break
+        return summary
+
+    async def backfill_team_metadata(
+        self,
+        *,
+        team_ids: Sequence[int],
+    ) -> SyncSummary:
+        """Optionally enrich selected teams through one `/teams?id=...` call each."""
+
+        unique_team_ids = _validated_team_ids(team_ids)
+        summary = SyncSummary(teams_requested=len(unique_team_ids))
+        for team_id in unique_team_ids:
+            try:
+                payload = await self.client.team_by_id(team_id)
+            except Exception as exc:
+                if _is_rate_limit_error(exc):
+                    self._stop_for_limit(summary, exc)
+                    return summary
+                summary.errors += 1
+                logger.exception('Team metadata request failed for team %s.', team_id)
+                summary.messages.append(
+                    f'[equipo {team_id}] metadatos no disponibles: '
+                    f'{type(exc).__name__}'
+                )
+                continue
+            if payload is None:
+                summary.errors += 1
+                summary.messages.append(
+                    f'[equipo {team_id}] API-Football no devolvió metadatos.'
+                )
+                continue
+            try:
+                await self.repository.persist_team_metadata(payload)
+            except Exception as exc:
+                summary.errors += 1
+                logger.exception('Could not persist metadata for team %s.', team_id)
+                summary.messages.append(
+                    f'[equipo {team_id}] no se pudieron guardar los metadatos: '
+                    f'{type(exc).__name__}'
+                )
+                continue
+            summary.teams_processed += 1
+            summary.team_metadata_updated += 1
+            _update_rate_summary(summary, self.client)
         return summary
 
     async def _sync_season(
@@ -518,6 +830,96 @@ def _fixture_id_or_none(item: Mapping[str, Any]) -> int | None:
         return int(item['fixture']['id'])
     except (KeyError, TypeError, ValueError):
         return None
+
+
+def _validated_team_ids(team_ids: Sequence[int]) -> list[int]:
+    unique_team_ids: list[int] = []
+    for value in team_ids:
+        try:
+            team_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('team_ids must contain positive integers.') from exc
+        if team_id < 1:
+            raise ValueError('team_ids must contain positive integers.')
+        if team_id not in unique_team_ids:
+            unique_team_ids.append(team_id)
+    if not unique_team_ids:
+        raise ValueError('At least one team_id is required.')
+    if len(unique_team_ids) > MAX_TEAM_BACKFILL_TARGETS:
+        raise ValueError(
+            f'At most {MAX_TEAM_BACKFILL_TARGETS} unique team IDs may be processed.'
+        )
+    return unique_team_ids
+
+
+def _provider_league_id_or_none(item: Mapping[str, Any]) -> int | None:
+    try:
+        return int(item['league']['id'])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _is_usable_raw_team_history_fixture(
+    item: Mapping[str, Any],
+    team_id: int,
+) -> bool:
+    try:
+        status = str(item['fixture']['status']['short']).upper()
+        home_team_id = int(item['teams']['home']['id'])
+        away_team_id = int(item['teams']['away']['id'])
+        home_goals = item['goals']['home']
+        away_goals = item['goals']['away']
+    except (KeyError, TypeError, ValueError):
+        return False
+    if status not in BASELINE_FINAL_STATUSES:
+        return False
+    if team_id not in {home_team_id, away_team_id}:
+        return False
+    return all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in (home_goals, away_goals)
+    )
+
+
+def _is_noncompetitive_league(league: Mapping[str, Any]) -> bool:
+    name = str(league.get('name') or '').casefold()
+    return 'friendl' in name or 'amistoso' in name
+
+
+def _is_usable_team_history_fixture(
+    normalized: NormalizedFixture,
+    team_id: int,
+) -> bool:
+    row = normalized.fixture
+    if str(row.get('status_short') or '').upper() not in BASELINE_FINAL_STATUSES:
+        return False
+    if team_id not in {
+        int(row.get('home_team_id') or 0),
+        int(row.get('away_team_id') or 0),
+    }:
+        return False
+    goals = (row.get('home_goals'), row.get('away_goals'))
+    return all(
+        isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        for value in goals
+    )
+
+
+def _team_fixture_sort_key(normalized: NormalizedFixture) -> tuple[int, int]:
+    try:
+        timestamp = int(normalized.fixture.get('timestamp') or 0)
+    except (TypeError, ValueError):
+        timestamp = 0
+    return timestamp, normalized.api_fixture_id
+
+
+def _raw_team_fixture_sort_key(item: Mapping[str, Any]) -> tuple[int, int]:
+    try:
+        timestamp = int(item['fixture'].get('timestamp') or 0)
+        fixture_id = int(item['fixture'].get('id') or 0)
+    except (KeyError, TypeError, ValueError):
+        return 0, 0
+    return timestamp, fixture_id
 
 
 def _chunks_by_competition(rows: Sequence[Mapping[str, Any]]) -> list[list[Mapping[str, Any]]]:

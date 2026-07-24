@@ -78,3 +78,22 @@ competitions:
     type: cup
     enabled: true
     resolved_api_league_id: null
+
+  - internal_code: uefa_europa_league
+    expected_name: UEFA Europa League
+    aliases:
+      - Europa League
+    country: World
+    type: cup
+    enabled: true
+    resolved_api_league_id: null
+
+  - internal_code: friendlies_clubs
+    expected_name: Friendlies Clubs
+    aliases:
+      - Club Friendlies
+      - International Club Friendlies
+    country: World
+    type: cup
+    enabled: true
+    resolved_api_league_id: null

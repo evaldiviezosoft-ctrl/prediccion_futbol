@@ -341,6 +341,114 @@ def test_fixture_details_enforces_twenty_id_batch_limit():
     asyncio.run(exercise())
 
 
+def test_team_history_uses_bounded_team_specific_fixture_query_and_cache():
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request):
+        calls.append(dict(request.url.params))
+        return httpx.Response(
+            200,
+            json=_envelope([{'fixture': {'id': 7001}}]),
+        )
+
+    http_client = httpx.AsyncClient(
+        base_url='https://example.test',
+        transport=httpx.MockTransport(handler),
+    )
+    client = ApiFootballClient(settings=_settings(), http_client=http_client)
+
+    async def exercise():
+        try:
+            first = await client.fixtures_for_team(
+                69,
+                last=20,
+                status='FT-AET-PEN',
+                timezone_name='America/Lima',
+            )
+            second = await client.fixtures_for_team(
+                69,
+                last=20,
+                status='FT-AET-PEN',
+                timezone_name='America/Lima',
+            )
+            assert second == first
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(exercise())
+    assert calls == [{
+        'team': '69',
+        'last': '20',
+        'timezone': 'America/Lima',
+        'status': 'FT-AET-PEN',
+    }]
+
+
+def test_team_history_can_use_an_explicit_plan_allowed_season():
+    calls: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request):
+        calls.append(dict(request.url.params))
+        return httpx.Response(200, json=_envelope([]))
+
+    http_client = httpx.AsyncClient(
+        base_url='https://example.test',
+        transport=httpx.MockTransport(handler),
+    )
+    client = ApiFootballClient(settings=_settings(), http_client=http_client)
+
+    async def exercise():
+        try:
+            await client.fixtures_for_team(
+                69,
+                season=2024,
+                timezone_name='America/Lima',
+            )
+            with pytest.raises(ValueError, match='exactly one'):
+                await client.fixtures_for_team(
+                    69,
+                    last=20,
+                    season=2024,
+                )
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(exercise())
+    assert calls == [{
+        'team': '69',
+        'timezone': 'America/Lima',
+        'season': '2024',
+    }]
+
+
+def test_team_metadata_selects_only_the_exact_provider_team():
+    def handler(request: httpx.Request):
+        assert request.url.path == '/teams'
+        assert request.url.params['id'] == '76'
+        return httpx.Response(
+            200,
+            json=_envelope([
+                {'team': {'id': 999, 'name': 'Wrong'}},
+                {'team': {'id': 76, 'name': 'Requested'}},
+            ]),
+        )
+
+    http_client = httpx.AsyncClient(
+        base_url='https://example.test',
+        transport=httpx.MockTransport(handler),
+    )
+    client = ApiFootballClient(settings=_settings(), http_client=http_client)
+
+    async def exercise():
+        try:
+            result = await client.team_by_id(76)
+            assert result == {'team': {'id': 76, 'name': 'Requested'}}
+        finally:
+            await http_client.aclose()
+
+    asyncio.run(exercise())
+
+
 def test_optional_fixture_methods_use_expected_endpoints_and_bypass_cache():
     calls: list[tuple[str, str]] = []
 

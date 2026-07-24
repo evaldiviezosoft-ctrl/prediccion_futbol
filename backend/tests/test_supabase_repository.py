@@ -239,6 +239,126 @@ def test_mark_sync_component_pending_resets_statistics_and_increments_attempts()
     assert changes['last_error'] == 'empty normalized statistics'
 
 
+def test_targeted_competition_is_disabled_and_deterministic():
+    repository = SupabaseRepository(client=object())
+    repository._select = AsyncMock(return_value=[])
+    repository._upsert = AsyncMock(return_value=[{
+        'id': 40,
+        'api_league_id': 40,
+        'internal_code': 'api_40',
+        'name': 'Championship',
+        'country': 'England',
+        'competition_type': 'league',
+        'enabled': False,
+    }])
+
+    stored = asyncio.run(repository.ensure_targeted_competition({
+        'id': 40,
+        'name': 'Championship',
+        'country': 'England',
+        'logo': 'league.png',
+    }))
+
+    assert stored['internal_code'] == 'api_40'
+    written = repository._upsert.await_args.args[1]
+    assert written['api_league_id'] == 40
+    assert written['enabled'] is False
+    assert repository._upsert.await_args.kwargs['on_conflict'] == 'api_league_id'
+
+
+def test_team_metadata_persists_country_and_existing_venue_shape():
+    repository = SupabaseRepository(client=object())
+    calls = []
+
+    async def upsert(table, rows, **kwargs):
+        calls.append((table, rows, kwargs))
+        return [{'id': 76}] if table == 'teams' else []
+
+    repository._upsert = upsert
+    result = asyncio.run(repository.persist_team_metadata({
+        'team': {
+            'id': 76,
+            'name': 'Team 76',
+            'code': 'T76',
+            'country': 'England',
+            'founded': 1901,
+            'national': False,
+            'logo': 'team.png',
+        },
+        'venue': {
+            'id': 9076,
+            'name': 'Ground',
+            'city': 'City',
+            'capacity': 12_000,
+            'surface': 'grass',
+            'image': 'ground.png',
+        },
+    }))
+
+    assert calls[0][0] == 'teams'
+    assert calls[0][1]['country'] == 'England'
+    assert calls[1][0] == 'venues'
+    assert calls[1][1]['api_venue_id'] == 9076
+    assert result == {
+        'api_team_id': 76,
+        'team_ref_id': 76,
+        'api_venue_id': 9076,
+    }
+
+
+def test_fixture_statistics_completion_uses_normalized_rows_not_sync_flag():
+    repository = SupabaseRepository(client=object())
+    repository._select = AsyncMock(return_value=[
+        {'fixture_id': 8001},
+        {'fixture_id': 8001},
+    ])
+
+    result = asyncio.run(repository.fixture_ids_with_team_statistics(
+        [8001, 8002, 8001]
+    ))
+
+    assert result == {8001}
+    assert repository._select.await_args.kwargs == {
+        'columns': 'fixture_id',
+        'in_values': {'fixture_id': [8001, 8002]},
+    }
+
+
+def test_targeted_team_history_query_is_not_restricted_to_modeled_leagues():
+    repository = SupabaseRepository(client=object())
+    calls = []
+
+    async def select(table, **kwargs):
+        calls.append((table, kwargs))
+        team_column = next(iter(kwargs['equals']))
+        return [{
+            'id': 9001 if team_column == 'home_team_id' else 9002,
+            'kickoff': (
+                '2026-07-20T00:00:00+00:00'
+                if team_column == 'home_team_id'
+                else '2026-07-21T00:00:00+00:00'
+            ),
+        }]
+
+    repository._select = select
+    rows = asyncio.run(repository.historical_finished_fixtures_for_team(
+        api_team_id=69,
+        kickoff='2026-07-24T00:00:00+00:00',
+        limit=10,
+    ))
+
+    assert [row['id'] for row in rows] == [9002, 9001]
+    assert {next(iter(kwargs['equals'])) for _, kwargs in calls} == {
+        'home_team_id',
+        'away_team_id',
+    }
+    assert all('league_id' not in kwargs['in_values'] for _, kwargs in calls)
+    assert all(
+        kwargs['lt_values'] == {'kickoff': '2026-07-24T00:00:00+00:00'}
+        for _, kwargs in calls
+    )
+
+
 def test_mark_sync_component_pending_rejects_unknown_component():
     repository = SupabaseRepository(client=object())
     with pytest.raises(ValueError, match='Unsupported sync component'):

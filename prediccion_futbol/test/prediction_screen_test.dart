@@ -29,15 +29,25 @@ class _CountingRepository implements FootballDataSource {
   void dispose() {}
 }
 
-FixtureSummary _fixture(int leagueId) => FixtureSummary(
+FixtureSummary _fixture(
+  int leagueId, {
+  bool predictionFallbackAvailable = false,
+  String? homeTeamCountry,
+  String? awayTeamCountry,
+}) => FixtureSummary(
   id: 1,
   homeTeam: 'Local',
   awayTeam: 'Visitante',
+  homeTeamCountry: homeTeamCountry,
+  awayTeamCountry: awayTeamCountry,
   kickoff: DateTime.utc(2026, 7, 23),
   leagueId: leagueId,
+  predictionFallbackAvailable: predictionFallbackAvailable,
 );
 
-Prediction _baselinePrediction() => Prediction.fromJson({
+Prediction _baselinePrediction({
+  Map<String, dynamic>? crossLeagueCalibration,
+}) => Prediction.fromJson({
   'fixture_id': 1,
   'home_team_name': 'Local',
   'away_team_name': 'Visitante',
@@ -68,6 +78,7 @@ Prediction _baselinePrediction() => Prediction.fromJson({
   'model_metadata': {
     'model_type': 'statistical_baseline',
     'sample_sizes': {'home_team_home_matches': 4, 'away_team_away_matches': 8},
+    'cross_league_calibration': ?crossLeagueCalibration,
     'market_statistics': {
       'reference_statistics_league_id': 281,
       'teams': {
@@ -80,6 +91,47 @@ Prediction _baselinePrediction() => Prediction.fromJson({
     },
   },
 });
+
+Prediction _fallbackPrediction({bool singleTeamProfile = true}) =>
+    Prediction.fromJson({
+      'fixture_id': 1,
+      'home_team_name': 'Local',
+      'away_team_name': 'Visitante',
+      'stage': 'orientative',
+      'home_win_probability': 0.42,
+      'draw_probability': 0.29,
+      'away_win_probability': 0.29,
+      'over25_probability': 0.41,
+      'btts_probability': 0.46,
+      'expected': {
+        'home_goals': 1.2,
+        'away_goals': 0.9,
+        'home_corners': 5.5,
+        'away_corners': 4.4,
+        'home_shots': 13.2,
+        'away_shots': 10.1,
+        'home_shots_on_target': 4.8,
+        'away_shots_on_target': 3.6,
+      },
+      'goal_lines': [
+        {'line': 0.5, 'probability': 0.88},
+        {'line': 1.5, 'probability': 0.62},
+        {'line': 2.5, 'probability': 0.41},
+        {'line': 3.5, 'probability': 0.2},
+        {'line': 4.5, 'probability': 0.08},
+      ],
+      'possible_scorers': <Map<String, dynamic>>[],
+      'possible_assistants': <Map<String, dynamic>>[],
+      'updated_at': DateTime.now().toUtc().toIso8601String(),
+      'model_metadata': {
+        'model_type': 'calendar_fallback',
+        'confidence': 'low',
+        'single_team_profile': singleTeamProfile,
+        'known_profile_sides': singleTeamProfile
+            ? <String>['home']
+            : <String>['home', 'away'],
+      },
+    });
 
 void main() {
   testWidgets('una liga sin modelo no abre una suscripción', (tester) async {
@@ -95,6 +147,94 @@ void main() {
     expect(repository.watchCalls, 0);
   });
 
+  testWidgets(
+    'un fallback consulta la predicción y advierte que es orientativa',
+    (tester) async {
+      final repository = _CountingRepository(_fallbackPrediction());
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PredictionScreen(
+            fixture: _fixture(667, predictionFallbackAvailable: true),
+            repository: repository,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(repository.watchCalls, 1);
+      expect(find.text('Predicción orientativa'), findsOneWidget);
+      expect(
+        find.textContaining(
+          'solo uno de los equipos tiene historial; no publicamos 1X2',
+        ),
+        findsOneWidget,
+      );
+      expect(find.text('Predicción 1X2 (probabilidad)'), findsNothing);
+
+      await tester.scrollUntilVisible(find.text('Goles totales'), 300);
+      expect(find.text('Más de 4.5 goles'), findsOneWidget);
+
+      await tester.scrollUntilVisible(
+        find.text('Estadísticas por equipo'),
+        300,
+      );
+      expect(find.text('5.5'), findsOneWidget);
+      expect(find.text('4.4'), findsNothing);
+      expect(find.text('—'), findsWidgets);
+
+      await tester.scrollUntilVisible(find.text('Goleadores probables'), 300);
+      expect(
+        find.text(
+          'Aún no hay plantel o historial individual reciente suficiente.',
+        ),
+        findsAtLeastNWidgets(1),
+      );
+      await tester.scrollUntilVisible(find.text('Asistidores probables'), 300);
+      expect(
+        find.text(
+          'Aún no hay plantel o historial individual reciente suficiente.',
+        ),
+        findsWidgets,
+      );
+
+      await tester.scrollUntilVisible(
+        find.textContaining('no garantiza resultados'),
+        300,
+      );
+      expect(
+        find.text('Predicción orientativa • baja confianza'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('un fallback con ambos perfiles sí muestra 1X2', (tester) async {
+    final repository = _CountingRepository(
+      _fallbackPrediction(singleTeamProfile: false),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(
+          fixture: _fixture(667, predictionFallbackAvailable: true),
+          repository: repository,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text('Predicción 1X2 (probabilidad)'),
+      300,
+    );
+    expect(find.text('Predicción 1X2 (probabilidad)'), findsOneWidget);
+    expect(
+      find.textContaining('solo uno de los equipos tiene historial'),
+      findsNothing,
+    );
+  });
+
   testWidgets('una liga modelada consulta la predicción', (tester) async {
     final repository = _CountingRepository();
 
@@ -107,6 +247,70 @@ void main() {
 
     expect(repository.watchCalls, 1);
     expect(find.text('Predicción en preparación'), findsOneWidget);
+  });
+
+  testWidgets('la cabecera muestra el país debajo de cada club', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(_baselinePrediction());
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(
+          fixture: _fixture(
+            39,
+            homeTeamCountry: 'Spain',
+            awayTeamCountry: 'Gibraltar',
+          ),
+          repository: repository,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Spain'), findsOneWidget);
+    expect(find.text('Gibraltar'), findsOneWidget);
+  });
+
+  testWidgets('el pie explica la calibración aplicada entre competiciones', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _baselinePrediction(
+        crossLeagueCalibration: {
+          'applied': true,
+          'home_source': {'competition_name': 'Eliteserien', 'factor': 0.91},
+          'away_source': {'competition_name': 'Premier League', 'factor': 1.08},
+        },
+      ),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(
+          fixture: _fixture(667, predictionFallbackAvailable: true),
+          repository: repository,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text('Calibración orientativa por competición'),
+      300,
+    );
+    expect(
+      find.text('Calibración orientativa por competición'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('Eliteserien 0.91 · Premier League 1.08'),
+      findsOneWidget,
+    );
+    expect(
+      find.textContaining('factores de contexto, no probabilidades'),
+      findsOneWidget,
+    );
   });
 
   testWidgets('una liga sudamericana con baseline consulta la predicción', (
@@ -159,6 +363,10 @@ void main() {
         300,
       );
       expect(find.textContaining('no garantizan resultados'), findsOneWidget);
+      expect(
+        find.text('Calibración orientativa por competición'),
+        findsNothing,
+      );
       expect(find.text('Marcadores probables'), findsNothing);
     },
   );

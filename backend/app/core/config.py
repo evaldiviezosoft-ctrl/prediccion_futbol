@@ -72,9 +72,11 @@ class Settings(BaseSettings):
     admin_token: SecretStr | None = None
 
     enable_scheduler: bool = False
+    scheduler_run_on_startup: bool = False
     max_matches_per_scheduler_cycle: int = Field(default=5, ge=1, le=25)
     scheduler_horizon_days: int = Field(default=7, ge=1, le=30)
-    scheduler_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    scheduler_daily_hour: int = Field(default=0, ge=0, le=23)
+    scheduler_daily_minute: int = Field(default=5, ge=0, le=59)
     default_timezone: str = 'America/Lima'
     model_root: Path = Path('./models')
     team_profile_root: Path = Path('./data/team_profiles')

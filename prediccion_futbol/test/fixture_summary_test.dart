@@ -11,6 +11,8 @@ void main() {
       'fixture_date_lima': '2026-07-22T20:00:00',
       'league_id': 281,
       'league_name': 'Primera División',
+      'home_team_country': 'Peru',
+      'away_team_country': 'Peru',
       'home_team_logo_url': 'https://example.test/alianza.png',
       'away_team_logo_url': 'https://example.test/cristal.png',
     });
@@ -28,6 +30,8 @@ void main() {
     expect(fromApi.displayKickoff, DateTime(2026, 7, 22, 20));
     expect(fromApi.homeTeamLogoUrl, 'https://example.test/alianza.png');
     expect(fromApi.awayTeamLogoUrl, 'https://example.test/cristal.png');
+    expect(fromApi.homeTeamCountry, 'Peru');
+    expect(fromApi.awayTeamCountry, 'Peru');
     expect(fromApi.predictionModelAvailable, isTrue);
     expect(fromApi.predictionStatusLabel, 'Esperando predicción');
     expect(fallback.leagueName, 'Brasileirão Série A');
@@ -47,6 +51,31 @@ void main() {
     expect(fixture.predictionStatusLabel, 'Esperando predicción');
   });
 
+  test('competiciones de calendario se muestran sin afirmar un modelo', () {
+    final europaLeague = FixtureSummary(
+      id: 20,
+      homeTeam: 'Equipo local',
+      awayTeam: 'Equipo visitante',
+      kickoff: DateTime.utc(2026, 7, 24),
+      leagueId: 3,
+    );
+    final clubFriendly = FixtureSummary(
+      id: 21,
+      homeTeam: 'Barcelona',
+      awayTeam: 'Manchester United',
+      kickoff: DateTime.utc(2026, 7, 24),
+      leagueId: 667,
+      apiLeagueName: 'Friendlies Clubs',
+    );
+
+    expect(europaLeague.leagueName, 'UEFA Europa League');
+    expect(europaLeague.predictionModelAvailable, isFalse);
+    expect(europaLeague.predictionStatusLabel, 'Modelo aún no disponible');
+    expect(clubFriendly.leagueName, 'Amistosos de clubes');
+    expect(clubFriendly.predictionModelAvailable, isFalse);
+    expect(clubFriendly.predictionStatusLabel, 'Modelo aún no disponible');
+  });
+
   test('el backend puede desactivar la capacidad sin cambiar Flutter', () {
     final fixture = FixtureSummary.fromJson({
       'id': 12,
@@ -60,6 +89,30 @@ void main() {
     expect(fixture.predictionModelAvailable, isFalse);
     expect(fixture.predictionStatusLabel, 'Modelo aún no disponible');
   });
+
+  test(
+    'un fallback permite abrir una guía sin afirmar que existe un modelo',
+    () {
+      final fixture = FixtureSummary.fromJson({
+        'id': 22,
+        'home_team_name': 'Barcelona',
+        'away_team_name': 'Europa FC',
+        'kickoff': '2026-07-24T18:00:00Z',
+        'league_id': 667,
+        'prediction_available': true,
+        'prediction_model_available': false,
+        'prediction_fallback_available': true,
+      });
+
+      expect(fixture.predictionModelAvailable, isFalse);
+      expect(fixture.predictionFallbackAvailable, isTrue);
+      expect(fixture.predictionAccessAvailable, isTrue);
+      expect(
+        fixture.predictionStatusLabel,
+        'Predicción orientativa disponible',
+      );
+    },
+  );
 
   test('el fallback horario también usa Lima y no la zona del dispositivo', () {
     final fixture = FixtureSummary.fromJson({

@@ -456,6 +456,256 @@ def test_market_backfill_rejects_present_but_empty_statistics_array():
     assert args[4] == 'Required component has no normalized rows: statistics'
 
 
+def _team_history_payload(
+    *,
+    fixture_id: int,
+    league_id: int,
+    league_name: str,
+    home_team_id: int,
+    away_team_id: int,
+    timestamp: int,
+) -> dict:
+    item = fixture_payload(fixture_id=fixture_id)
+    item['fixture']['timestamp'] = timestamp
+    item['league'].update({
+        'id': league_id,
+        'name': league_name,
+        'country': 'England',
+        'season': 2025,
+    })
+    item['teams']['home']['id'] = home_team_id
+    item['teams']['away']['id'] = away_team_id
+    item['statistics'][0]['team']['id'] = home_team_id
+    return item
+
+
+def test_team_backfill_supports_uncatalogued_domestic_leagues_and_deduplicates():
+    shared = _team_history_payload(
+        fixture_id=8001,
+        league_id=40,
+        league_name='Championship',
+        home_team_id=69,
+        away_team_id=76,
+        timestamp=1_700_000_001,
+    )
+    second = _team_history_payload(
+        fixture_id=8002,
+        league_id=41,
+        league_name='League One',
+        home_team_id=76,
+        away_team_id=5,
+        timestamp=1_700_000_002,
+    )
+    friendly = _team_history_payload(
+        fixture_id=8003,
+        league_id=667,
+        league_name='Friendlies Clubs',
+        home_team_id=69,
+        away_team_id=6,
+        timestamp=1_700_000_003,
+    )
+    wrong_team = _team_history_payload(
+        fixture_id=8004,
+        league_id=40,
+        league_name='Championship',
+        home_team_id=7,
+        away_team_id=8,
+        timestamp=1_700_000_004,
+    )
+
+    class TeamRepository(FakeRepository):
+        def __init__(self):
+            super().__init__()
+            self.competitions = {}
+            self.statistics_complete = {8001}
+
+        async def ensure_targeted_competition(self, league):
+            league_id = int(league['id'])
+            self.competitions.setdefault(league_id, {
+                'id': 1_000 + league_id,
+                'api_league_id': league_id,
+                'internal_code': f'api_{league_id}',
+                'name': league['name'],
+                'country': league['country'],
+                'competition_type': 'league',
+                'enabled': False,
+            })
+            return self.competitions[league_id]
+
+        async def fixture_ids_with_team_statistics(self, fixture_ids):
+            return set(fixture_ids) & self.statistics_complete
+
+    class TeamClient(FakeClient):
+        def __init__(self):
+            super().__init__(detail_items={8002: second})
+            self.team_calls = []
+
+        async def fixtures_for_team(self, team, **kwargs):
+            self.team_calls.append((team, kwargs))
+            return (
+                [shared, friendly, wrong_team]
+                if team == 69
+                else [shared, second]
+            )
+
+    repository = TeamRepository()
+    client = TeamClient()
+    summary = asyncio.run(HistoricalSyncService(client, repository).backfill_team_history(
+        team_ids=[69, 76, 69],
+        max_fixtures_per_team=20,
+        max_detail_fixtures=10,
+    ))
+
+    assert [call[0] for call in client.team_calls] == [69, 76]
+    assert all(call[1] == {
+        'last': 20,
+        'timezone_name': 'America/Lima',
+    } for call in client.team_calls)
+    assert set(repository.competitions) == {40, 41}
+    assert [item.api_fixture_id for item in repository.persisted_basic] == [8001, 8002]
+    assert client.detail_calls == [[8002]]
+    assert summary.teams_requested == 2
+    assert summary.teams_processed == 2
+    assert summary.fixtures_discovered == 5
+    assert summary.fixtures_deduplicated == 1
+    assert summary.fixtures_skipped == 2
+    assert summary.details_skipped_existing == 1
+    assert summary.details_complete == 1
+
+
+def test_team_backfill_batches_details_by_default_and_prioritizes_recency():
+    older = _team_history_payload(
+        fixture_id=8101,
+        league_id=94,
+        league_name='Primeira Liga',
+        home_team_id=104,
+        away_team_id=10,
+        timestamp=1_600_000_000,
+    )
+    newer = _team_history_payload(
+        fixture_id=8102,
+        league_id=94,
+        league_name='Primeira Liga',
+        home_team_id=11,
+        away_team_id=104,
+        timestamp=1_700_000_000,
+    )
+
+    class TeamRepository(FakeRepository):
+        async def ensure_targeted_competition(self, league):
+            return {
+                **self.competition,
+                'id': 94,
+                'api_league_id': 94,
+                'internal_code': 'api_94',
+                'name': league['name'],
+            }
+
+        async def fixture_ids_with_team_statistics(self, _fixture_ids):
+            return set()
+
+    class TeamClient(FakeClient):
+        def __init__(self):
+            super().__init__(detail_items={8101: older, 8102: newer})
+
+        async def fixtures_for_team(self, team, **_kwargs):
+            assert team == 104
+            return [older, newer]
+
+    repository = TeamRepository()
+    client = TeamClient()
+    summary = asyncio.run(HistoricalSyncService(client, repository).backfill_team_history(
+        team_ids=[104],
+        max_detail_fixtures=2,
+    ))
+
+    assert client.detail_calls == [[8102, 8101]]
+    assert summary.details_complete == 2
+
+
+def test_team_backfill_saves_first_team_before_request_budget_stop():
+    item = _team_history_payload(
+        fixture_id=8201,
+        league_id=203,
+        league_name='Süper Lig',
+        home_team_id=235,
+        away_team_id=12,
+        timestamp=1_700_000_100,
+    )
+    snapshot = RateLimitSnapshot(
+        daily_limit=100,
+        daily_remaining=15,
+        requests_this_run=2,
+        max_requests_per_run=2,
+        daily_safety_reserve=15,
+    )
+
+    class TeamRepository(FakeRepository):
+        async def ensure_targeted_competition(self, league):
+            return {
+                **self.competition,
+                'id': 203,
+                'api_league_id': 203,
+                'internal_code': 'api_203',
+                'name': league['name'],
+            }
+
+    class TeamClient(FakeClient):
+        async def fixtures_for_team(self, team, **_kwargs):
+            if team == 235:
+                return [item]
+            raise RateLimitExhaustedError('daily_safety_reserve', snapshot)
+
+    repository = TeamRepository()
+    client = TeamClient()
+    client.rate_limit.snapshot = snapshot
+    summary = asyncio.run(HistoricalSyncService(client, repository).backfill_team_history(
+        team_ids=[235, 331],
+    ))
+
+    assert [value.api_fixture_id for value in repository.persisted_basic] == [8201]
+    assert summary.stopped_safely is True
+    assert summary.teams_processed == 1
+    assert client.detail_calls == []
+
+
+def test_team_metadata_backfill_is_separate_and_quota_bounded():
+    class MetadataRepository(FakeRepository):
+        def __init__(self):
+            super().__init__()
+            self.metadata = []
+
+        async def persist_team_metadata(self, payload):
+            self.metadata.append(payload)
+
+    class MetadataClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.metadata_calls = []
+
+        async def team_by_id(self, team):
+            self.metadata_calls.append(team)
+            return {
+                'team': {
+                    'id': team,
+                    'name': f'Team {team}',
+                    'country': 'England',
+                },
+                'venue': {'id': 900 + team, 'name': 'Ground'},
+            }
+
+    repository = MetadataRepository()
+    client = MetadataClient()
+    summary = asyncio.run(HistoricalSyncService(client, repository).backfill_team_metadata(
+        team_ids=[69, 76, 69]
+    ))
+
+    assert client.metadata_calls == [69, 76]
+    assert [row['team']['id'] for row in repository.metadata] == [69, 76]
+    assert summary.teams_requested == 2
+    assert summary.team_metadata_updated == 2
+
+
 def test_legacy_model_code_is_preserved_when_competition_is_resolved():
     repository = SupabaseRepository(client=object())
     repository._select = AsyncMock(return_value=[{'id': 39, 'code': 'E0'}])

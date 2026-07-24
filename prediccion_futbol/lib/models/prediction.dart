@@ -29,6 +29,49 @@ class PossibleScorer {
   );
 }
 
+class CrossLeagueCalibration {
+  const CrossLeagueCalibration({
+    required this.homeCompetition,
+    required this.homeFactor,
+    required this.awayCompetition,
+    required this.awayFactor,
+  });
+
+  final String homeCompetition;
+  final double homeFactor;
+  final String awayCompetition;
+  final double awayFactor;
+
+  static CrossLeagueCalibration? tryParse(Object? value) {
+    if (value is! Map || value['applied'] != true) return null;
+    final home = value['home_source'];
+    final away = value['away_source'];
+    if (home is! Map || away is! Map) return null;
+
+    final homeCompetition = _optionalText(home['competition_name']);
+    final awayCompetition = _optionalText(away['competition_name']);
+    final homeFactor = (home['factor'] as num?)?.toDouble();
+    final awayFactor = (away['factor'] as num?)?.toDouble();
+    if (homeCompetition == null ||
+        awayCompetition == null ||
+        homeFactor == null ||
+        awayFactor == null ||
+        !homeFactor.isFinite ||
+        !awayFactor.isFinite ||
+        homeFactor <= 0 ||
+        awayFactor <= 0) {
+      return null;
+    }
+
+    return CrossLeagueCalibration(
+      homeCompetition: homeCompetition,
+      homeFactor: homeFactor,
+      awayCompetition: awayCompetition,
+      awayFactor: awayFactor,
+    );
+  }
+}
+
 class Prediction {
   const Prediction({
     required this.fixtureId,
@@ -46,12 +89,16 @@ class Prediction {
     required this.possibleScorers,
     required this.possibleAssistants,
     required this.updatedAt,
+    this.homeTeamCountry,
+    this.awayTeamCountry,
     this.modelMetadata = const {},
   });
 
   final int fixtureId;
   final String homeTeam;
   final String awayTeam;
+  final String? homeTeamCountry;
+  final String? awayTeamCountry;
   final String stage;
   final bool lineupsConfirmed;
   final double homeWin;
@@ -70,6 +117,44 @@ class Prediction {
 
   bool get isStatisticalBaseline =>
       modelMetadata['model_type'] == 'statistical_baseline';
+
+  bool get isLowConfidenceFallback {
+    final modelType = modelMetadata['model_type']?.toString().toLowerCase();
+    final confidence = modelMetadata['confidence']?.toString().toLowerCase();
+    return confidence == 'low' ||
+        modelType == 'calendar_fallback' ||
+        modelType == 'calendar_low_confidence_fallback' ||
+        modelType == 'low_confidence_fallback';
+  }
+
+  bool get isSingleTeamProfileFallback =>
+      isLowConfidenceFallback && modelMetadata['single_team_profile'] == true;
+
+  CrossLeagueCalibration? get crossLeagueCalibration =>
+      CrossLeagueCalibration.tryParse(
+        modelMetadata['cross_league_calibration'],
+      );
+
+  Set<String> get knownProfileSides {
+    final rawSides = modelMetadata['known_profile_sides'];
+    if (rawSides is! List) return const {};
+    return rawSides
+        .map((side) => side.toString().toLowerCase())
+        .where((side) => side == 'home' || side == 'away')
+        .toSet();
+  }
+
+  double? displayExpectedValue(String key) {
+    if (isSingleTeamProfileFallback) {
+      final side = key.startsWith('home_')
+          ? 'home'
+          : key.startsWith('away_')
+          ? 'away'
+          : null;
+      if (side != null && !knownProfileSides.contains(side)) return null;
+    }
+    return expectedValue(key);
+  }
 
   int? get homeVenueSample {
     final sizes = modelMetadata['sample_sizes'];
@@ -134,6 +219,8 @@ class Prediction {
       fixtureId: (json['fixture_id'] as num).toInt(),
       homeTeam: json['home_team_name'] as String,
       awayTeam: json['away_team_name'] as String,
+      homeTeamCountry: _optionalText(json['home_team_country']),
+      awayTeamCountry: _optionalText(json['away_team_country']),
       stage: json['stage'] as String,
       lineupsConfirmed: json['lineups_confirmed'] as bool? ?? false,
       homeWin: number('home_win_probability'),
@@ -176,4 +263,9 @@ class Prediction {
       ),
     );
   }
+}
+
+String? _optionalText(Object? value) {
+  final text = value?.toString().trim();
+  return text == null || text.isEmpty ? null : text;
 }

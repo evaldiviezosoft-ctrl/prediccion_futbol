@@ -9,13 +9,19 @@ from app.core.errors import DatabaseError, PredictionInputError, ProviderError
 from app.db.supabase_client import get_supabase
 from app.services.api_football_client import ApiFootballClient
 from app.services.baseline_model_service import BASELINE_LEAGUE_IDS
+from app.services.fixture_normalizer import (
+    FixtureNormalizationError,
+    NormalizedFixture,
+    normalize_fixture,
+)
 from app.services.supabase_repository import SupabaseRepository
 
 
 LEAGUE_ID_TO_CODE = {39: 'E0', 61: 'F1', 78: 'D1', 135: 'I1', 140: 'SP1'}
 BUNDLED_LEAGUE_IDS = frozenset(LEAGUE_ID_TO_CODE)
 SUPPORTED_LEAGUE_IDS = BUNDLED_LEAGUE_IDS | BASELINE_LEAGUE_IDS
-SYNC_LEAGUE_IDS = SUPPORTED_LEAGUE_IDS
+CALENDAR_ONLY_LEAGUE_IDS = frozenset({3, 667})
+SYNC_LEAGUE_IDS = SUPPORTED_LEAGUE_IDS | CALENDAR_ONLY_LEAGUE_IDS
 
 
 @dataclass(frozen=True)
@@ -92,9 +98,10 @@ async def sync_fixtures_by_date(
         raise PredictionInputError('Fixture date must use YYYY-MM-DD.') from exc
 
     client = db_client if db_client is not None else get_supabase()
+    repository = SupabaseRepository(client=client)
     owns_api = api_client is None
     api = api_client or ApiFootballClient(
-        request_log_sink=SupabaseRepository(client=client)
+        request_log_sink=repository
     )
     try:
         payload = await api.fixtures_by_date(
@@ -111,7 +118,25 @@ async def sync_fixtures_by_date(
             rate_limit = _rate_limit_payload(api)
         if not isinstance(items, list):
             raise ProviderError('API-Football returned an invalid fixtures response.')
-        rows = []
+
+        try:
+            competitions = await repository.list_enabled_competitions()
+        except Exception as exc:
+            raise DatabaseError('Could not load enabled competitions.') from exc
+        competitions_by_league: dict[int, dict[str, Any]] = {}
+        for competition in competitions:
+            api_league_id = competition.get('api_league_id')
+            if api_league_id is None:
+                continue
+            try:
+                league_id = int(api_league_id)
+            except (TypeError, ValueError):
+                continue
+            if league_id in SYNC_LEAGUE_IDS:
+                competitions_by_league[league_id] = competition
+
+        normalized_rows: list[NormalizedFixture] = []
+        grouped: dict[int, tuple[dict[str, Any], list[NormalizedFixture]]] = {}
         for item in items:
             if not isinstance(item, dict):
                 raise ProviderError('API-Football returned an invalid fixture payload.')
@@ -119,10 +144,38 @@ async def sync_fixtures_by_date(
                 league_id = int(item['league']['id'])
             except (KeyError, TypeError, ValueError) as exc:
                 raise ProviderError('API-Football returned an invalid league payload.') from exc
-            if league_id in SYNC_LEAGUE_IDS:
-                rows.append(fixture_row_from_api(item))
+            if league_id not in SYNC_LEAGUE_IDS:
+                continue
+            competition = competitions_by_league.get(league_id)
+            if competition is None:
+                # A synchronizable provider league is not enough to construct
+                # relational metadata safely. It must first be resolved into
+                # the configured competitions table.
+                continue
+            try:
+                normalized = normalize_fixture(
+                    item,
+                    competition_id=int(competition['id']),
+                )
+            except (FixtureNormalizationError, KeyError, TypeError, ValueError) as exc:
+                raise ProviderError(
+                    'API-Football returned an incomplete fixture payload.'
+                ) from exc
+            normalized_rows.append(normalized)
+            competition_id = int(competition['id'])
+            if competition_id not in grouped:
+                grouped[competition_id] = (competition, [])
+            grouped[competition_id][1].append(normalized)
 
-        _upsert_rows(rows, client)
+        try:
+            for competition, fixtures in grouped.values():
+                await repository.persist_fixtures_basic(
+                    fixtures,
+                    competition=competition,
+                )
+        except Exception as exc:
+            raise DatabaseError('Could not persist fixtures.') from exc
+        rows = [dict(normalized.fixture) for normalized in normalized_rows]
         return FixtureSyncResult(rows=rows, rate_limit=rate_limit)
     finally:
         if owns_api:

@@ -196,6 +196,31 @@ def goal_line_probabilities(total_mean: float) -> list[dict[str, float]]:
     return result
 
 
+def poisson_markets_from_expected_goals(
+    home_mean: float,
+    away_mean: float,
+) -> dict[str, Any]:
+    """Build the shared match-market contract from two evidenced goal means."""
+
+    means = (float(home_mean), float(away_mean))
+    if any(value < 0 or not math.isfinite(value) for value in means):
+        raise ValueError('Expected-goal means must be finite and nonnegative.')
+    probabilities, _likely_scores = _score_probabilities(*means)
+    goal_lines = goal_line_probabilities(sum(means))
+    over_2_5 = next(
+        market['probability'] for market in goal_lines if market['line'] == 2.5
+    )
+    btts = (1.0 - math.exp(-means[0])) * (1.0 - math.exp(-means[1]))
+    return {
+        'probabilities': {
+            **probabilities,
+            'over_2_5': round(over_2_5, 4),
+            'btts': round(btts, 4),
+        },
+        'goal_lines': goal_lines,
+    }
+
+
 def predict_empirical_bayes_poisson(
     *,
     league_id: int,
@@ -263,17 +288,9 @@ def predict_empirical_bayes_poisson(
 
     expected_home_goals = (home_attack + away_defence) / 2.0
     expected_away_goals = (away_attack + home_defence) / 2.0
-    result_probabilities, _likely_scores = _score_probabilities(
+    markets = poisson_markets_from_expected_goals(
         expected_home_goals,
         expected_away_goals,
-    )
-    total_mean = expected_home_goals + expected_away_goals
-    goal_lines = goal_line_probabilities(total_mean)
-    over_2_5 = next(
-        market['probability'] for market in goal_lines if market['line'] == 2.5
-    )
-    btts = (1.0 - math.exp(-expected_home_goals)) * (
-        1.0 - math.exp(-expected_away_goals)
     )
 
     first_kickoff = matches[0].kickoff.isoformat()
@@ -292,9 +309,7 @@ def predict_empirical_bayes_poisson(
     }
     return {
         'probabilities': {
-            **result_probabilities,
-            'over_2_5': round(over_2_5, 4),
-            'btts': round(btts, 4),
+            **markets['probabilities'],
         },
         # This baseline has no statistical source for corners or shots. Do not
         # manufacture them: only modeled goal expectations belong here.
@@ -302,7 +317,7 @@ def predict_empirical_bayes_poisson(
             'home_goals': round(expected_home_goals, 3),
             'away_goals': round(expected_away_goals, 3),
         },
-        'goal_lines': goal_lines,
+        'goal_lines': markets['goal_lines'],
         'likely_scores': [],
         'features': {
             'cutoff_kickoff': cutoff.isoformat(),

@@ -19,8 +19,9 @@ from app.services.baseline_model_service import (
     BASELINE_LEAGUE_IDS,
     BASELINE_UPCOMING_STATUSES,
 )
+from app.services.calendar_visibility import filter_visible_calendar_fixtures
 from app.services.fixture_service import (
-    SUPPORTED_LEAGUE_IDS,
+    CALENDAR_ONLY_LEAGUE_IDS,
     sync_fixtures_by_date,
     validate_timezone,
 )
@@ -67,13 +68,17 @@ async def predict_stored_baselines(
     database = db_client if db_client is not None else get_supabase()
     repository = SupabaseRepository(client=database)
     try:
-        fixtures = await repository.stored_upcoming_fixtures(
-            league_ids=BASELINE_LEAGUE_IDS,
+        candidates = await repository.stored_upcoming_fixtures(
+            league_ids=BASELINE_LEAGUE_IDS | CALENDAR_ONLY_LEAGUE_IDS,
             start_kickoff=start.isoformat(),
             end_kickoff=end.isoformat(),
             statuses=BASELINE_UPCOMING_STATUSES,
-            limit=max_matches,
+            limit=1000,
         )
+        fixtures = filter_visible_calendar_fixtures(
+            database,
+            candidates,
+        )[:max_matches]
     except Exception as exc:
         raise DatabaseError('Could not read stored upcoming fixtures.') from exc
 
@@ -176,11 +181,14 @@ async def sync_and_predict(
             for row in result.rows:
                 fixtures[int(row['id'])] = row
 
+        visible_fixtures = filter_visible_calendar_fixtures(
+            db,
+            list(fixtures.values()),
+        )
         eligible = [
             row
-            for row in fixtures.values()
+            for row in visible_fixtures
             if row.get('status_short') in NOT_STARTED_STATUSES
-            and int(row.get('league_id') or 0) in SUPPORTED_LEAGUE_IDS
             and _kickoff_utc(row) > clock_utc
         ]
         eligible.sort(key=_kickoff_utc)

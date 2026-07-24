@@ -1,9 +1,15 @@
 import asyncio
 from pathlib import Path
 
+import pytest
+
 from app.core.config import Settings
 from app.schemas.api_football import CompetitionSpec
-from app.services.competition_resolver import CompetitionResolver, load_competition_config
+from app.services.competition_resolver import (
+    CompetitionResolutionError,
+    CompetitionResolver,
+    load_competition_config,
+)
 
 
 CONFIG_PATH = Path(__file__).resolve().parents[1] / 'app' / 'config' / 'competitions.yaml'
@@ -49,15 +55,36 @@ def _settings():
     )
 
 
-def test_yaml_contains_exactly_ten_unresolved_competitions():
+def test_yaml_contains_unique_unresolved_competitions():
     config = load_competition_config(CONFIG_PATH)
 
-    assert len(config.competitions) == 10
-    assert len({item.internal_code for item in config.competitions}) == 10
+    internal_codes = {item.internal_code for item in config.competitions}
+    assert len(internal_codes) == len(config.competitions)
+    assert {
+        'peru_liga_1',
+        'uefa_europa_league',
+        'friendlies_clubs',
+    } <= internal_codes
     assert all(item.resolved_api_league_id is None for item in config.competitions)
     peru = next(item for item in config.competitions if item.internal_code == 'peru_liga_1')
     assert 'Liga 1' in peru.aliases
     assert 'Primera División' in peru.aliases
+    europa = next(
+        item for item in config.competitions if item.internal_code == 'uefa_europa_league'
+    )
+    assert europa.expected_name == 'UEFA Europa League'
+    friendlies = next(
+        item for item in config.competitions if item.internal_code == 'friendlies_clubs'
+    )
+    assert friendlies.expected_name == 'Friendlies Clubs'
+
+
+def test_empty_competition_config_is_rejected(tmp_path):
+    config_path = tmp_path / 'competitions.yaml'
+    config_path.write_text('competitions: []\n', encoding='utf-8')
+
+    with pytest.raises(CompetitionResolutionError, match='at least one competition'):
+        load_competition_config(config_path)
 
 
 def test_resolver_selects_safe_name_country_and_type_match_and_persists_it():

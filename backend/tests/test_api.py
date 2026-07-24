@@ -69,16 +69,91 @@ class UpcomingDatabase:
                 'created_at': '2099-01-01T00:00:00+00:00',
                 'updated_at': '2099-01-01T00:00:00+00:00',
             }],
-            'leagues': [{'id': 39, 'code': 'E0', 'name': 'Premier League'}],
+            'leagues': [{
+                'id': 39,
+                'code': 'E0',
+                'name': 'Premier League',
+                'country': 'England',
+            }],
             'predictions': [{'fixture_id': 123, 'stage': 'prematch'}],
             'teams': [
-                {'api_team_id': 10, 'logo_url': 'https://example.test/arsenal.png'},
-                {'api_team_id': 20, 'logo_url': 'https://example.test/villa.png'},
+                {
+                    'api_team_id': 10,
+                    'country': 'England',
+                    'logo_url': 'https://example.test/arsenal.png',
+                },
+                {
+                    'api_team_id': 20,
+                    'country': 'England',
+                    'logo_url': 'https://example.test/villa.png',
+                },
             ],
         }
 
     def table(self, name):
         return ReadQuery(self, name)
+
+
+class UpcomingHistoryQuery(ReadQuery):
+    def __init__(self, database, table):
+        super().__init__(database, table)
+        self.selected_columns = ''
+        self.not_equal_filters = []
+        self.less_than_filters = []
+        self.candidate_ids = set()
+        self.start = 0
+        self.end = None
+
+    def select(self, columns):
+        self.selected_columns = columns
+        return super().select(columns)
+
+    def neq(self, column, value):
+        self.not_equal_filters.append((column, value))
+        return self
+
+    def lt(self, column, value):
+        if self.selected_columns == (
+            'id,home_team_id,away_team_id,home_goals,away_goals'
+        ):
+            self.less_than_filters.append((column, value))
+        return self
+
+    def or_(self, filters):
+        encoded_values = filters.split('(', 1)[1].split(')', 1)[0]
+        self.candidate_ids = {
+            int(value) for value in encoded_values.split(',') if value
+        }
+        return self
+
+    def range(self, start, end):
+        self.start = start
+        self.end = end
+        return self
+
+    def execute(self):
+        rows = list(self.database.rows[self.table])
+        for column, values in self.in_filters:
+            rows = [row for row in rows if row.get(column) in values]
+        for column, value in self.not_equal_filters:
+            rows = [row for row in rows if row.get(column) != value]
+        for column, value in self.less_than_filters:
+            rows = [row for row in rows if str(row.get(column) or '') < value]
+        if self.candidate_ids:
+            rows = [
+                row for row in rows
+                if (
+                    row.get('home_team_id') in self.candidate_ids
+                    or row.get('away_team_id') in self.candidate_ids
+                )
+            ]
+        end = self.end + 1 if self.end is not None else None
+        return SimpleNamespace(data=rows[self.start:end])
+
+
+class UpcomingHistoryDatabase(UpcomingDatabase):
+    def table(self, name):
+        return UpcomingHistoryQuery(self, name)
 
 
 class MissingPredictionQuery:
@@ -105,6 +180,8 @@ class PublishedPredictionQuery(MissingPredictionQuery):
         return SimpleNamespace(data={
             'fixture_id': 1492292,
             'published': True,
+            'home_team_id': 177,
+            'away_team_id': 127,
             'home_team_name': 'Chapecoense-SC',
             'away_team_name': 'Flamengo',
             'likely_scores': [{'score': '1-2', 'probability': 0.12}],
@@ -119,10 +196,18 @@ class PublishedPredictionQuery(MissingPredictionQuery):
         })
 
 
-class PublishedPredictionDatabase:
+class PublishedPredictionDatabase(UpcomingDatabase):
+    def __init__(self):
+        super().__init__()
+        self.rows['teams'] = [
+            {'api_team_id': 177, 'country': 'Brazil'},
+            {'api_team_id': 127, 'country': 'Brazil'},
+        ]
+
     def table(self, name):
-        assert name == 'predictions'
-        return PublishedPredictionQuery()
+        if name == 'predictions':
+            return PublishedPredictionQuery()
+        return ReadQuery(self, name)
 
 
 def settings_with_admin(token=VALID_ADMIN_TOKEN) -> Settings:
@@ -164,7 +249,10 @@ def test_upcoming_fixture_contract_includes_league_and_prediction_state(monkeypa
     assert item['prediction_available'] is True
     assert item['prediction_stage'] == 'prematch'
     assert item['prediction_model_available'] is True
+    assert item['prediction_fallback_available'] is False
     assert item['fixture_date_lima'] == '2099-08-22T13:00:00'
+    assert item['home_team_country'] == 'England'
+    assert item['away_team_country'] == 'England'
     assert item['home_team_logo_url'] == 'https://example.test/arsenal.png'
     assert item['away_team_logo_url'] == 'https://example.test/villa.png'
     assert item['home_team_logo_proxy_path'] == '/fixtures/team-logo/10'
@@ -172,6 +260,100 @@ def test_upcoming_fixture_contract_includes_league_and_prediction_state(monkeypa
     fixture_columns = dict(database.selects)['fixtures']
     assert 'raw_payload' not in fixture_columns
     assert dict(database.selects)['predictions'] == 'fixture_id,stage'
+
+
+def test_upcoming_uses_modeled_league_country_when_team_metadata_is_missing(
+    monkeypatch,
+):
+    database = UpcomingDatabase()
+    for team in database.rows['teams']:
+        team['country'] = None
+    monkeypatch.setattr(fixtures, 'get_supabase', lambda: database)
+
+    with TestClient(app) as client:
+        response = client.get('/fixtures/upcoming')
+
+    assert response.status_code == 200
+    item = response.json()[0]
+    assert item['home_team_country'] == 'England'
+    assert item['away_team_country'] == 'England'
+
+
+def test_upcoming_marks_profile_backed_calendar_fallback_separately(monkeypatch):
+    database = UpcomingDatabase()
+    database.rows['fixtures'][0].update({
+        'id': 667001,
+        'league_id': 667,
+        'home_team_name': 'Barcelona',
+        'away_team_name': 'Europa FC',
+    })
+    database.rows['leagues'] = [{
+        'id': 667,
+        'code': 'friendlies_clubs',
+        'name': 'Friendlies Clubs',
+        'country': 'World',
+    }]
+    database.rows['predictions'] = []
+    for team in database.rows['teams']:
+        team['country'] = None
+    monkeypatch.setattr(fixtures, 'get_supabase', lambda: database)
+
+    with TestClient(app) as client:
+        response = client.get('/fixtures/upcoming')
+
+    assert response.status_code == 200
+    item = response.json()[0]
+    assert item['prediction_model_available'] is False
+    assert item['prediction_fallback_available'] is True
+    assert item['home_team_country'] == 'Spain'
+    assert item['away_team_country'] is None
+
+
+def test_upcoming_marks_history_only_calendar_fixture_as_fallback(monkeypatch):
+    database = UpcomingHistoryDatabase()
+    upcoming = database.rows['fixtures'][0]
+    upcoming.update({
+        'id': 667002,
+        'league_id': 667,
+        'home_team_id': 100,
+        'away_team_id': 200,
+        'home_team_name': 'Historical Club',
+        'away_team_name': 'Unknown XI',
+    })
+    database.rows['fixtures'].extend([
+        {
+            'id': 800 + index,
+            'league_id': 40,
+            'status_short': 'FT',
+            'kickoff': '2098-08-22T18:00:00+00:00',
+            'home_team_id': 100,
+            'away_team_id': 900 + index,
+            'home_goals': 2,
+            'away_goals': 1,
+        }
+        for index in range(5)
+    ])
+    database.rows['leagues'] = [{
+        'id': 667,
+        'code': 'friendlies_clubs',
+        'name': 'Friendlies Clubs',
+        'country': 'World',
+    }]
+    database.rows['predictions'] = []
+    database.rows['teams'] = [
+        {'api_team_id': 100, 'country': 'Portugal', 'logo_url': None},
+        {'api_team_id': 200, 'country': None, 'logo_url': None},
+    ]
+    monkeypatch.setattr(fixtures, 'get_supabase', lambda: database)
+
+    with TestClient(app) as client:
+        response = client.get('/fixtures/upcoming')
+
+    assert response.status_code == 200
+    items = response.json()
+    assert [item['id'] for item in items] == [667002]
+    assert items[0]['prediction_model_available'] is False
+    assert items[0]['prediction_fallback_available'] is True
 
 
 def test_upcoming_fixture_endpoint_excludes_terminal_states(monkeypatch):
@@ -254,6 +436,8 @@ def test_published_prediction_contract_returns_model_metadata(monkeypatch):
     }
     assert response.json()['goal_lines'] == [{'line': 0.5, 'probability': 0.9}]
     assert response.json()['possible_assistants'][0]['player'] == 'Jugador A'
+    assert response.json()['home_team_country'] == 'Brazil'
+    assert response.json()['away_team_country'] == 'Brazil'
     assert 'likely_scores' not in response.json()
 
 

@@ -320,3 +320,318 @@ def test_south_american_refresh_rejects_non_upcoming_fixture(
 
     assert repository.history_calls == []
     assert db.operations == []
+
+
+class CalendarFallbackRepository:
+    def __init__(self, fixture):
+        self.fixture = fixture
+        self.targeted_history_calls = []
+        self.targeted_history = []
+        self.team_statistics_call = None
+        self.targeted_team_statistics = []
+        self.player_call = None
+        kickoff = datetime.fromisoformat(fixture['kickoff'])
+        self.known_history = [{
+            'id': 900,
+            'league_id': 39,
+            'season': 2098,
+            'kickoff': (kickoff - timedelta(days=30)).isoformat(),
+            'status_short': 'FT',
+            'home_team_id': 999,
+            'away_team_id': self.fixture['away_team_id'],
+            'home_team_ref_id': 1999,
+            'away_team_ref_id': (
+                self.fixture.get('away_team_ref_id')
+                or self.fixture['away_team_id']
+            ),
+            'home_goals': 0,
+            'away_goals': 2,
+        }]
+
+    async def prediction_fixture(self, fixture_id):
+        return self.fixture if fixture_id == self.fixture['id'] else None
+
+    async def historical_finished_fixtures_for_team(self, **kwargs):
+        self.targeted_history_calls.append(kwargs)
+        return [
+            row for row in [*self.known_history, *self.targeted_history]
+            if int(kwargs['api_team_id']) in {
+                int(row['home_team_id']),
+                int(row['away_team_id']),
+            }
+        ]
+
+    async def team_statistics_for_fixtures(self, fixture_ids):
+        self.team_statistics_call = set(fixture_ids)
+        return [
+            row for row in self.targeted_team_statistics
+            if int(row['fixture_id']) in self.team_statistics_call
+        ]
+
+    async def historical_finished_fixtures_before_many(self, **kwargs):
+        raise AssertionError(
+            'Calendar fallback must query exact teams, not complete leagues.'
+        )
+
+    async def player_statistics_for_fixtures(self, **kwargs):
+        self.player_call = kwargs
+        return [
+            {
+                'fixture_id': 900,
+                'player_id': 501,
+                'team_id': self.fixture['away_team_id'],
+                'starter': True,
+                'substitute': False,
+                'minutes': 90,
+                'goals': 1,
+                'assists': 0,
+            },
+            {
+                'fixture_id': 900,
+                'player_id': 777,
+                'team_id': self.fixture['home_team_id'],
+                'starter': True,
+                'substitute': False,
+                'minutes': 90,
+                'goals': 2,
+                'assists': 1,
+            },
+        ]
+
+    async def players_by_ids(self, _player_ids):
+        return {
+            501: {'id': 501, 'name': 'Known United scorer'},
+            777: {'id': 777, 'name': 'Unknown rival player'},
+        }
+
+
+def test_calendar_fallback_is_db_only_and_never_invents_unknown_rival_players(
+    monkeypatch,
+):
+    db = RecordingDb()
+    fixture = stored_fixture_row(880, league_id=667)
+    fixture.update({
+        'home_team_name': 'Rosenborg',
+        'away_team_name': 'Manchester United',
+        'home_team_ref_id': fixture['home_team_id'],
+        'away_team_ref_id': fixture['away_team_id'],
+    })
+    repository = CalendarFallbackRepository(fixture)
+    monkeypatch.setattr(
+        prediction_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+
+    def forbidden_api_client(**_kwargs):
+        raise AssertionError('Calendar fallback must not construct ApiFootballClient.')
+
+    monkeypatch.setattr(
+        prediction_service,
+        'ApiFootballClient',
+        forbidden_api_client,
+    )
+
+    record = asyncio.run(
+        prediction_service.refresh_prediction(880, db_client=db)
+    )
+
+    assert record['model_metadata']['model_type'] == 'calendar_profile_fallback'
+    assert record['model_metadata']['method'] == 'calendar_profile_poisson'
+    assert record['model_metadata']['confidence'] == 'low'
+    assert record['model_metadata']['single_team_profile'] is True
+    assert [market['line'] for market in record['model_metadata']['goal_lines']] == [
+        0.5, 1.5, 2.5, 3.5, 4.5,
+    ]
+    assert 'home_shots' not in record['expected']
+    assert record['possible_scorers'][0]['player'] == 'Known United scorer'
+    assert all(
+        player['team_id'] == fixture['away_team_id']
+        for player in record['possible_scorers']
+    )
+    assert record['model_metadata']['possible_assistants'] == []
+    assert repository.player_call['team_ids'] == {fixture['away_team_id']}
+    assert {
+        call['api_team_id'] for call in repository.targeted_history_calls
+    } == {fixture['home_team_id'], fixture['away_team_id']}
+    assert [(operation, table) for operation, table, _payload in db.operations] == [
+        ('upsert', 'predictions'),
+        ('insert', 'prediction_versions'),
+    ]
+
+
+def test_calendar_fallback_promotes_targeted_team_history_to_a_profile(monkeypatch):
+    db = RecordingDb()
+    fixture = stored_fixture_row(881, league_id=667)
+    fixture.update({
+        'home_team_name': 'Rosenborg',
+        'away_team_name': 'Manchester United',
+        'home_team_ref_id': None,
+        'away_team_ref_id': fixture['away_team_id'],
+    })
+    repository = CalendarFallbackRepository(fixture)
+    kickoff = datetime.fromisoformat(fixture['kickoff'])
+    repository.targeted_history = [
+        {
+            'id': 1000 + index,
+            'league_id': 103 if index < 3 else 104,
+            'season': 2098,
+            'kickoff': (kickoff - timedelta(days=70 - index)).isoformat(),
+            'status_short': 'FT',
+            'home_team_id': fixture['home_team_id'],
+            'away_team_id': 3000 + index,
+            'home_team_ref_id': 1010,
+            'away_team_ref_id': 4000 + index,
+            'home_goals': 1 + (index % 2),
+            'away_goals': index % 2,
+        }
+        for index in range(6)
+    ]
+    repository.targeted_team_statistics = [
+        {
+            'fixture_id': row['id'],
+            'team_id': 1010,
+            'is_home': True,
+            'corners': 6,
+            'total_shots': 13,
+            'shots_on_goal': 5,
+        }
+        for row in repository.targeted_history
+    ]
+    monkeypatch.setattr(
+        prediction_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+
+    def forbidden_api_client(**_kwargs):
+        raise AssertionError('Calendar fallback must remain DB-only.')
+
+    monkeypatch.setattr(
+        prediction_service,
+        'ApiFootballClient',
+        forbidden_api_client,
+    )
+
+    record = asyncio.run(
+        prediction_service.refresh_prediction(881, db_client=db)
+    )
+
+    metadata = record['model_metadata']
+    assert metadata['known_profile_sides'] == ['home', 'away']
+    assert metadata['single_team_profile'] is False
+    assert metadata['data_source'] == (
+        'local_profiles_and_supabase_team_history'
+    )
+    assert record['features_snapshot']['profiles']['home']['source_kind'] == (
+        'supabase_team_history'
+    )
+    assert 0 < record['expected']['home_corners'] <= 6.0
+    assert 0 < record['expected']['home_shots'] <= 13.0
+    assert 0 < record['expected']['home_shots_on_target'] <= 5.0
+    home_metrics = metadata['market_statistics']['teams']['home']['metrics']
+    assert all(
+        metric['team_sample_used'] is True
+        for metric in home_metrics.values()
+    )
+    assert repository.team_statistics_call == {
+        row['id'] for row in repository.targeted_history
+    }
+    assert 1010 in repository.player_call['team_ids']
+    assert {
+        row['id'] for row in repository.targeted_history
+    } <= set(repository.player_call['fixture_ids'])
+    home_source = metadata['history_sources']['home']
+    assert home_source['source_league_id'] == 103
+    assert home_source['eligible_team_matches'] == 6
+
+
+def test_calendar_fallback_supports_two_teams_with_targeted_history(monkeypatch):
+    db = RecordingDb()
+    fixture = stored_fixture_row(882, league_id=667)
+    fixture.update({
+        'home_team_name': 'Rosenborg',
+        'away_team_name': 'Galatasaray',
+        'home_team_ref_id': 1010,
+        'away_team_ref_id': 2020,
+    })
+    repository = CalendarFallbackRepository(fixture)
+    repository.known_history = []
+    kickoff = datetime.fromisoformat(fixture['kickoff'])
+    repository.targeted_history = [
+        {
+            'id': 1100 + index,
+            'league_id': 103,
+            'season': 2098,
+            'kickoff': (kickoff - timedelta(days=80 - index)).isoformat(),
+            'status_short': 'FT',
+            'home_team_id': fixture['home_team_id'],
+            'away_team_id': 3100 + index,
+            'home_team_ref_id': fixture['home_team_ref_id'],
+            'away_team_ref_id': 4100 + index,
+            'home_goals': 2,
+            'away_goals': index % 2,
+        }
+        for index in range(5)
+    ] + [
+        {
+            'id': 1200 + index,
+            'league_id': 203,
+            'season': 2098,
+            'kickoff': (kickoff - timedelta(days=75 - index)).isoformat(),
+            'status_short': 'FT',
+            'home_team_id': 3200 + index,
+            'away_team_id': fixture['away_team_id'],
+            'home_team_ref_id': 4200 + index,
+            'away_team_ref_id': fixture['away_team_ref_id'],
+            'home_goals': index % 2,
+            'away_goals': 1,
+        }
+        for index in range(5)
+    ]
+    monkeypatch.setattr(
+        prediction_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+
+    record = asyncio.run(
+        prediction_service.refresh_prediction(882, db_client=db)
+    )
+
+    assert record['model_metadata']['known_profile_sides'] == [
+        'home',
+        'away',
+    ]
+    assert record['model_metadata']['single_team_profile'] is False
+    assert record['model_metadata']['data_source'] == 'supabase_team_history'
+    profiles = record['features_snapshot']['profiles']
+    assert profiles['home']['source_kind'] == 'supabase_team_history'
+    assert profiles['away']['source_kind'] == 'supabase_team_history'
+    assert profiles['home']['league_code'] is None
+    assert profiles['away']['league_code'] is None
+
+
+def test_calendar_fallback_preserves_semantic_error_without_team_history(
+    monkeypatch,
+):
+    db = RecordingDb()
+    fixture = stored_fixture_row(883, league_id=667)
+    fixture.update({
+        'home_team_name': 'Unknown Home XI',
+        'away_team_name': 'Unknown Away XI',
+        'home_team_ref_id': 1010,
+        'away_team_ref_id': 2020,
+    })
+    repository = CalendarFallbackRepository(fixture)
+    repository.known_history = []
+    monkeypatch.setattr(
+        prediction_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+
+    with pytest.raises(PredictionInputError, match='At least one team'):
+        asyncio.run(
+            prediction_service.refresh_prediction(883, db_client=db)
+        )

@@ -259,7 +259,9 @@ class _FeaturedFixture extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final statusColor = fixture.predictionAvailable
+    final statusColor = fixture.predictionFallbackAvailable
+        ? AppColors.amber
+        : fixture.predictionAvailable
         ? AppColors.primary
         : AppColors.amber;
     return Card(
@@ -278,14 +280,18 @@ class _FeaturedFixture extends StatelessWidget {
                     color: AppColors.muted,
                   ),
                   const SizedBox(width: 8),
-                  Text(
-                    fixture.leagueName,
-                    style: const TextStyle(
-                      color: AppColors.muted,
-                      fontWeight: FontWeight.w700,
+                  Expanded(
+                    child: Text(
+                      fixture.leagueName,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: AppColors.muted,
+                        fontWeight: FontWeight.w700,
+                      ),
                     ),
                   ),
-                  const Spacer(),
+                  const SizedBox(width: 8),
                   Text(
                     _featuredKickoff(fixture.displayKickoff),
                     style: const TextStyle(
@@ -301,6 +307,7 @@ class _FeaturedFixture extends StatelessWidget {
                   Expanded(
                     child: _FeaturedTeam(
                       team: fixture.homeTeam,
+                      country: fixture.homeTeamCountry,
                       logoUrl: fixture.homeTeamLogoUrl,
                     ),
                   ),
@@ -318,6 +325,7 @@ class _FeaturedFixture extends StatelessWidget {
                   Expanded(
                     child: _FeaturedTeam(
                       team: fixture.awayTeam,
+                      country: fixture.awayTeamCountry,
                       logoUrl: fixture.awayTeamLogoUrl,
                     ),
                   ),
@@ -326,34 +334,43 @@ class _FeaturedFixture extends StatelessWidget {
               const SizedBox(height: 22),
               const Divider(height: 1),
               const SizedBox(height: 16),
-              Row(
-                children: [
-                  Icon(
-                    fixture.predictionAvailable
-                        ? Icons.check_circle_outline
-                        : Icons.schedule,
+              LayoutBuilder(
+                builder: (context, constraints) {
+                  final status = _FixtureStatus(
+                    fixture: fixture,
                     color: statusColor,
-                    size: 21,
-                  ),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(
-                      fixture.predictionStatusLabel,
-                      style: TextStyle(
-                        color: statusColor,
-                        fontWeight: FontWeight.w700,
-                      ),
+                  );
+                  final action = FilledButton.icon(
+                    onPressed: onTap,
+                    icon: const Icon(Icons.bar_chart_rounded, size: 19),
+                    label: Text(
+                      fixture.predictionFallbackAvailable
+                          ? 'Ver guía'
+                          : 'Ver predicción',
                     ),
-                  ),
-                  if (fixture.predictionAvailable)
-                    FilledButton.icon(
-                      onPressed: onTap,
-                      icon: const Icon(Icons.bar_chart_rounded, size: 19),
-                      label: const Text('Ver predicción'),
-                    )
-                  else
-                    const Icon(Icons.chevron_right, color: AppColors.muted),
-                ],
+                  );
+                  if (constraints.maxWidth < 300) {
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        status,
+                        if (fixture.predictionAvailable) ...[
+                          const SizedBox(height: 12),
+                          action,
+                        ],
+                      ],
+                    );
+                  }
+                  return Row(
+                    children: [
+                      Expanded(child: status),
+                      if (fixture.predictionAvailable)
+                        action
+                      else
+                        const Icon(Icons.chevron_right, color: AppColors.muted),
+                    ],
+                  );
+                },
               ),
             ],
           ),
@@ -363,10 +380,42 @@ class _FeaturedFixture extends StatelessWidget {
   }
 }
 
+class _FixtureStatus extends StatelessWidget {
+  const _FixtureStatus({required this.fixture, required this.color});
+
+  final FixtureSummary fixture;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(
+          fixture.predictionFallbackAvailable
+              ? Icons.warning_amber_rounded
+              : fixture.predictionAvailable
+              ? Icons.check_circle_outline
+              : Icons.schedule,
+          color: color,
+          size: 21,
+        ),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            fixture.predictionStatusLabel,
+            style: TextStyle(color: color, fontWeight: FontWeight.w700),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 class _FeaturedTeam extends StatelessWidget {
-  const _FeaturedTeam({required this.team, this.logoUrl});
+  const _FeaturedTeam({required this.team, this.country, this.logoUrl});
 
   final String team;
+  final String? country;
   final String? logoUrl;
 
   @override
@@ -386,6 +435,20 @@ class _FeaturedTeam extends StatelessWidget {
             fontWeight: FontWeight.w800,
           ),
         ),
+        if (country != null) ...[
+          const SizedBox(height: 4),
+          Text(
+            country!,
+            textAlign: TextAlign.center,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.muted,
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ],
       ],
     );
   }
@@ -411,12 +474,16 @@ class _DateHeader extends StatelessWidget {
             size: 21,
           ),
           const SizedBox(width: 10),
-          Text(
-            _spanishDate(date),
-            style: const TextStyle(
-              color: AppColors.text,
-              fontSize: 18,
-              fontWeight: FontWeight.w800,
+          Expanded(
+            child: Text(
+              _spanishDate(date),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: AppColors.text,
+                fontSize: 18,
+                fontWeight: FontWeight.w800,
+              ),
             ),
           ),
         ],
@@ -433,118 +500,220 @@ class _FixtureRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final statusColor = fixture.predictionAvailable
+    final statusColor = fixture.predictionFallbackAvailable
+        ? AppColors.amber
+        : fixture.predictionAvailable
         ? AppColors.primary
         : AppColors.amber;
     return Material(
       color: Colors.transparent,
       child: InkWell(
         onTap: onTap,
-        child: Container(
-          padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
-          decoration: const BoxDecoration(
-            border: Border(bottom: BorderSide(color: AppColors.border)),
-          ),
-          child: Row(
-            children: [
-              SizedBox(
-                width: 82,
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      fixture.leagueName,
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: AppColors.muted,
-                        fontSize: 12,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                    const SizedBox(height: 7),
-                    Text(
-                      DateFormat('HH:mm').format(fixture.displayKickoff),
-                      style: const TextStyle(
-                        color: AppColors.muted,
-                        fontWeight: FontWeight.w700,
-                      ),
-                    ),
-                  ],
-                ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 360;
+            final markSize = compact ? 32.0 : 36.0;
+            return Container(
+              padding: EdgeInsets.symmetric(
+                horizontal: compact ? 12 : 20,
+                vertical: 16,
               ),
-              const SizedBox(width: 8),
-              SizedBox(
-                width: 50,
-                height: 40,
-                child: Stack(
-                  children: [
-                    Positioned(
-                      left: 0,
-                      child: TeamMark(
-                        team: fixture.homeTeam,
-                        logoUrl: fixture.homeTeamLogoUrl,
-                        size: 36,
-                      ),
-                    ),
-                    Positioned(
-                      right: 0,
-                      child: TeamMark(
-                        team: fixture.awayTeam,
-                        logoUrl: fixture.awayTeamLogoUrl,
-                        size: 36,
-                      ),
-                    ),
-                  ],
-                ),
+              decoration: const BoxDecoration(
+                border: Border(bottom: BorderSide(color: AppColors.border)),
               ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '${fixture.homeTeam}  vs  ${fixture.awayTeam}',
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(
-                        color: AppColors.text,
-                        fontSize: 15,
-                        fontWeight: FontWeight.w800,
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
+              child: Row(
+                children: [
+                  SizedBox(
+                    width: compact ? 64 : 82,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Icon(
-                          fixture.predictionAvailable
-                              ? Icons.check_circle_outline
-                              : Icons.schedule,
-                          color: statusColor,
-                          size: 17,
+                        Text(
+                          fixture.leagueName,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: AppColors.muted,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w700,
+                          ),
                         ),
-                        const SizedBox(width: 6),
-                        Flexible(
-                          child: Text(
-                            fixture.predictionStatusLabel,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              color: statusColor,
-                              fontSize: 13,
-                              fontWeight: FontWeight.w700,
-                            ),
+                        const SizedBox(height: 7),
+                        Text(
+                          DateFormat('HH:mm').format(fixture.displayKickoff),
+                          style: const TextStyle(
+                            color: AppColors.muted,
+                            fontWeight: FontWeight.w700,
                           ),
                         ),
                       ],
                     ),
-                  ],
-                ),
+                  ),
+                  SizedBox(width: compact ? 6 : 8),
+                  SizedBox(
+                    width: compact ? 44 : 50,
+                    height: compact ? 36 : 40,
+                    child: Stack(
+                      children: [
+                        Positioned(
+                          left: 0,
+                          child: TeamMark(
+                            team: fixture.homeTeam,
+                            logoUrl: fixture.homeTeamLogoUrl,
+                            size: markSize,
+                          ),
+                        ),
+                        Positioned(
+                          right: 0,
+                          child: TeamMark(
+                            team: fixture.awayTeam,
+                            logoUrl: fixture.awayTeamLogoUrl,
+                            size: markSize,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(width: compact ? 8 : 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _FixtureTeamReferences(fixture: fixture),
+                        const SizedBox(height: 8),
+                        Row(
+                          children: [
+                            Icon(
+                              fixture.predictionFallbackAvailable
+                                  ? Icons.warning_amber_rounded
+                                  : fixture.predictionAvailable
+                                  ? Icons.check_circle_outline
+                                  : Icons.schedule,
+                              color: statusColor,
+                              size: 17,
+                            ),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: Text(
+                                fixture.predictionStatusLabel,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  color: statusColor,
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w700,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                  SizedBox(width: compact ? 2 : 6),
+                  const Icon(Icons.chevron_right, color: AppColors.muted),
+                ],
               ),
-              const SizedBox(width: 6),
-              const Icon(Icons.chevron_right, color: AppColors.muted),
-            ],
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _FixtureTeamReferences extends StatelessWidget {
+  const _FixtureTeamReferences({required this.fixture});
+
+  final FixtureSummary fixture;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _FixtureTeamReference(
+          fixtureId: fixture.id,
+          side: 'home',
+          team: fixture.homeTeam,
+          country: fixture.homeTeamCountry,
+          textAlign: TextAlign.left,
+          crossAxisAlignment: CrossAxisAlignment.start,
+        ),
+        const Padding(
+          padding: EdgeInsets.fromLTRB(5, 2, 5, 0),
+          child: Text(
+            'vs',
+            style: TextStyle(
+              color: AppColors.muted,
+              fontSize: 12,
+              fontWeight: FontWeight.w700,
+            ),
           ),
         ),
+        _FixtureTeamReference(
+          fixtureId: fixture.id,
+          side: 'away',
+          team: fixture.awayTeam,
+          country: fixture.awayTeamCountry,
+          textAlign: TextAlign.right,
+          crossAxisAlignment: CrossAxisAlignment.end,
+        ),
+      ],
+    );
+  }
+}
+
+class _FixtureTeamReference extends StatelessWidget {
+  const _FixtureTeamReference({
+    required this.fixtureId,
+    required this.side,
+    required this.team,
+    required this.country,
+    required this.textAlign,
+    required this.crossAxisAlignment,
+  });
+
+  final int fixtureId;
+  final String side;
+  final String team;
+  final String? country;
+  final TextAlign textAlign;
+  final CrossAxisAlignment crossAxisAlignment;
+
+  @override
+  Widget build(BuildContext context) {
+    final countryLabel = country?.trim();
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: crossAxisAlignment,
+        children: [
+          Text(
+            team,
+            textAlign: textAlign,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              color: AppColors.text,
+              fontSize: 15,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
+          if (countryLabel != null && countryLabel.isNotEmpty) ...[
+            const SizedBox(height: 3),
+            Text(
+              countryLabel,
+              key: ValueKey('fixture-$fixtureId-$side-country'),
+              textAlign: textAlign,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(
+                color: AppColors.muted,
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ],
       ),
     );
   }

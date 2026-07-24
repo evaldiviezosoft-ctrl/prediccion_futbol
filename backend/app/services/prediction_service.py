@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -28,12 +29,23 @@ from app.services.baseline_market_service import (
     estimate_team_statistics,
     public_history_sources,
 )
+from app.services.calendar_prediction_service import (
+    CALENDAR_PREDICTION_LEAGUES,
+    GLOBAL_TEAM_HISTORY_PRIOR_CODE,
+    build_calendar_profile_prediction,
+)
+from app.services.calendar_visibility import LocalTeamProfile, local_team_profile
 from app.services.feature_builder import build_features
-from app.services.fixture_service import LEAGUE_ID_TO_CODE, upsert_fixture_item
+from app.services.fixture_service import (
+    CALENDAR_ONLY_LEAGUE_IDS,
+    LEAGUE_ID_TO_CODE,
+    upsert_fixture_item,
+)
 from app.services.model_service import predict
 from app.services.odds_parser import parse_opening_odds
 from app.services.scorer_service import possible_scorers
 from app.services.supabase_repository import SupabaseRepository
+from app.services.team_history_profile import build_team_history_profile
 
 
 logger = logging.getLogger(__name__)
@@ -237,6 +249,371 @@ async def _refresh_statistical_baseline(
     return record
 
 
+def _calendar_player_history_sources(
+    *,
+    fixture_row: dict[str, Any],
+    projection: dict[str, Any],
+    target_kickoff: datetime,
+    historical_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    known_sides = set(projection['model']['known_profile_sides'])
+    eligible: list[dict[str, Any]] = []
+    for value in historical_rows:
+        row = dict(value)
+        try:
+            league_id = int(row['league_id'])
+            home_team_id = int(row['home_team_id'])
+            away_team_id = int(row['away_team_id'])
+            kickoff = _kickoff(row.get('kickoff') or row['fixture_date_utc'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if (
+            str(row.get('status_short') or '').upper()
+            not in BASELINE_FINAL_STATUSES
+            or league_id == 667
+            or row.get('home_goals') is None
+            or row.get('away_goals') is None
+            or kickoff >= target_kickoff
+        ):
+            continue
+        fixture_id = row.get('id') or row.get('api_fixture_id')
+        if fixture_id is None:
+            continue
+        row.update({
+            '_fixture_id': int(fixture_id),
+            '_league_id': league_id,
+            '_kickoff': kickoff,
+            '_home_team_id': home_team_id,
+            '_away_team_id': away_team_id,
+            '_home_team_ref_id': row.get('home_team_ref_id'),
+            '_away_team_ref_id': row.get('away_team_ref_id'),
+        })
+        eligible.append(row)
+    eligible.sort(key=lambda row: (row['_kickoff'], row['_fixture_id']))
+
+    sources: dict[str, dict[str, Any]] = {}
+    for side in ('home', 'away'):
+        api_team_id = int(fixture_row[f'{side}_team_id'])
+        profile = projection['features']['profiles'][side]
+        profile_history = profile.get('history')
+        history_team_ref_id = (
+            profile_history.get('surrogate_team_id')
+            if isinstance(profile_history, dict)
+            else None
+        )
+        if side not in known_sides:
+            team_ref_id = int(
+                fixture_row.get(f'{side}_team_ref_id')
+                or history_team_ref_id
+                or api_team_id
+            )
+            sources[side] = {
+                'team_api_id': api_team_id,
+                'team_ref_id': team_ref_id,
+                'venue': side,
+                'source_kind': 'neutral_prior_only',
+                'source_league_id': int(fixture_row['league_id']),
+                'eligible_league_fixtures': 0,
+                'eligible_team_matches': 0,
+                '_source_fixture_ids': (),
+                '_team_fixture_ids': (),
+                '_last_team_kickoff': None,
+            }
+            continue
+
+        team_rows = [
+            row
+            for row in eligible
+            if api_team_id in {
+                row['_home_team_id'],
+                row['_away_team_id'],
+            }
+        ]
+        inferred_team_ref_ids = {
+            int(team_ref_id)
+            for row in team_rows
+            for team_ref_id in (
+                row.get('_home_team_ref_id')
+                if row['_home_team_id'] == api_team_id
+                else row.get('_away_team_ref_id'),
+            )
+            if team_ref_id is not None
+        }
+        inferred_team_ref_id = (
+            next(iter(inferred_team_ref_ids))
+            if len(inferred_team_ref_ids) == 1
+            else None
+        )
+        team_ref_id = int(
+            fixture_row.get(f'{side}_team_ref_id')
+            or history_team_ref_id
+            or inferred_team_ref_id
+            or api_team_id
+        )
+        counts = Counter(row['_league_id'] for row in team_rows)
+        preferred_league_id = (
+            profile.get('source_league_id') or profile.get('league_id')
+        )
+        if counts:
+            source_league_id = min(
+                counts,
+                key=lambda league_id: (
+                    -counts[league_id],
+                    league_id != preferred_league_id,
+                    league_id,
+                ),
+            )
+            selected = team_rows
+            source_kind = (
+                f'{profile.get("source_kind") or "local_profile"}'
+                '_with_stored_history'
+            )
+        else:
+            source_league_id = int(
+                preferred_league_id or fixture_row['league_id']
+            )
+            selected = []
+            source_kind = 'local_profile_only'
+        fixture_ids = tuple(row['_fixture_id'] for row in selected)
+        sources[side] = {
+            'team_api_id': api_team_id,
+            'team_ref_id': team_ref_id,
+            'venue': side,
+            'source_kind': source_kind,
+            'source_league_id': source_league_id,
+            'eligible_league_fixtures': sum(
+                row['_league_id'] == source_league_id for row in eligible
+            ),
+            'eligible_team_matches': len(selected),
+            '_source_fixture_ids': fixture_ids,
+            '_team_fixture_ids': fixture_ids,
+            '_last_team_kickoff': (
+                selected[-1]['_kickoff'].isoformat() if selected else None
+            ),
+        }
+    return sources
+
+
+async def _calendar_history_profile_overrides(
+    *,
+    fixture_row: dict[str, Any],
+    target_kickoff: datetime,
+    repository: SupabaseRepository,
+) -> tuple[
+    dict[str, LocalTeamProfile],
+    dict[str, list[dict[str, Any]]],
+]:
+    """Build missing-side profiles from narrowly loaded Supabase history."""
+
+    local_profiles = {
+        side: local_team_profile(fixture_row.get(f'{side}_team_name'))
+        for side in ('home', 'away')
+    }
+    sides = ('home', 'away')
+    missing_sides = [
+        side for side, profile in local_profiles.items() if profile is None
+    ]
+    histories: list[list[dict[str, Any]]] = []
+    for side in sides:
+        histories.append(
+            await repository.historical_finished_fixtures_for_team(
+            api_team_id=int(fixture_row[f'{side}_team_id']),
+            kickoff=target_kickoff.isoformat(),
+            statuses=BASELINE_FINAL_STATUSES,
+            limit=100,
+        )
+        )
+    history_by_side = {
+        side: [
+            dict(row)
+            for row in rows
+            if int(row.get('league_id') or 0) != 667
+        ]
+        for side, rows in zip(sides, histories, strict=True)
+    }
+    fixture_ids = {
+        int(row['id'])
+        for side in missing_sides
+        for row in history_by_side[side]
+        if row.get('id') is not None
+    }
+    statistics_rows = (
+        await repository.team_statistics_for_fixtures(fixture_ids)
+        if fixture_ids
+        else []
+    )
+
+    overrides: dict[str, LocalTeamProfile] = {}
+    for side in missing_sides:
+        profile_values = build_team_history_profile(
+            api_team_id=int(fixture_row[f'{side}_team_id']),
+            team_name=str(fixture_row[f'{side}_team_name']),
+            team_ref_id=(
+                int(fixture_row[f'{side}_team_ref_id'])
+                if fixture_row.get(f'{side}_team_ref_id') is not None
+                else None
+            ),
+            fixture_rows=history_by_side[side],
+            team_statistics_rows=statistics_rows,
+            cutoff=target_kickoff,
+        )
+        if profile_values is None:
+            continue
+        overrides[side] = LocalTeamProfile(
+            league_code=GLOBAL_TEAM_HISTORY_PRIOR_CODE,
+            profile_name=str(fixture_row[f'{side}_team_name']),
+            values=profile_values,
+        )
+    return overrides, history_by_side
+
+
+async def _refresh_calendar_profile_fallback(
+    *,
+    fixture_id: int,
+    fixture_row: dict[str, Any],
+    repository: SupabaseRepository,
+    supabase: Any,
+) -> dict[str, Any]:
+    try:
+        league_id = int(fixture_row['league_id'])
+        home_team_id = int(fixture_row['home_team_id'])
+        away_team_id = int(fixture_row['away_team_id'])
+        home_team_name = str(fixture_row['home_team_name'])
+        away_team_name = str(fixture_row['away_team_name'])
+        kickoff = _kickoff(
+            fixture_row.get('kickoff') or fixture_row['fixture_date_utc']
+        )
+        status_short = str(fixture_row['status_short'] or '').upper()
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PredictionInputError(
+            'The stored fixture is incomplete for prediction.'
+        ) from exc
+    if (
+        league_id not in CALENDAR_ONLY_LEAGUE_IDS
+        or status_short not in BASELINE_UPCOMING_STATUSES
+        or kickoff <= datetime.now(timezone.utc)
+    ):
+        raise PredictionInputError('The stored fixture is no longer upcoming.')
+
+    try:
+        profile_overrides, targeted_history = (
+            await _calendar_history_profile_overrides(
+                fixture_row=fixture_row,
+                target_kickoff=kickoff,
+                repository=repository,
+            )
+        )
+        projection = build_calendar_profile_prediction(
+            league_id=league_id,
+            home_team_name=home_team_name,
+            away_team_name=away_team_name,
+            profile_overrides=profile_overrides,
+        )
+        historical_by_id = {
+            int(row.get('id') or row.get('api_fixture_id')): row
+            for row in (
+                row
+                for rows in targeted_history.values()
+                for row in rows
+            )
+            if row.get('id') is not None
+            or row.get('api_fixture_id') is not None
+        }
+        historical_rows = list(historical_by_id.values())
+        sources = _calendar_player_history_sources(
+            fixture_row=fixture_row,
+            projection=projection,
+            target_kickoff=kickoff,
+            historical_rows=historical_rows,
+        )
+        known_sides = set(projection['model']['known_profile_sides'])
+        known_team_ref_ids = {
+            int(sources[side]['team_ref_id']) for side in known_sides
+        }
+        player_fixture_ids = {
+            int(history_fixture_id)
+            for side in known_sides
+            for history_fixture_id in sources[side]['_team_fixture_ids']
+        }
+        player_statistics_rows = (
+            await repository.player_statistics_for_fixtures(
+                fixture_ids=player_fixture_ids,
+                team_ids=known_team_ref_ids,
+            )
+            if player_fixture_ids
+            else []
+        )
+        players_by_id = await repository.players_by_ids(
+            row['player_id']
+            for row in player_statistics_rows
+            if row.get('player_id') is not None
+        )
+    except PredictionInputError:
+        raise
+    except Exception as exc:
+        raise DatabaseError(
+            'Could not read stored calendar fallback history.'
+        ) from exc
+
+    scorers, assistants, player_metadata = estimate_player_candidates(
+        sources=sources,
+        target_kickoff=kickoff,
+        expected_goals=projection['expected'],
+        player_statistics_rows=player_statistics_rows,
+        players_by_id=players_by_id,
+        team_names={'home': home_team_name, 'away': away_team_name},
+    )
+    known_team_ids = {
+        int(sources[side]['team_api_id'])
+        for side in projection['model']['known_profile_sides']
+    }
+    scorers = [
+        player for player in scorers
+        if int(player['team_id']) in known_team_ids
+    ]
+    assistants = [
+        player for player in assistants
+        if int(player['team_id']) in known_team_ids
+    ]
+
+    league_code, _league_name = CALENDAR_PREDICTION_LEAGUES[league_id]
+    model_metadata = {
+        **projection['model'],
+        'goal_lines': projection['goal_lines'],
+        'possible_assistants': assistants,
+        'player_candidates': player_metadata,
+        'history_sources': public_history_sources(sources),
+        'cutoff_rule': 'stored status FT/AET/PEN and kickoff < target kickoff',
+        'cutoff_kickoff': kickoff.isoformat(),
+    }
+    record = {
+        'fixture_id': fixture_id,
+        'league_id': league_id,
+        'league_code': league_code,
+        'home_team_id': home_team_id,
+        'away_team_id': away_team_id,
+        'home_team_name': home_team_name,
+        'away_team_name': away_team_name,
+        'kickoff': kickoff.isoformat(),
+        'stage': _prediction_stage(kickoff),
+        'lineups_confirmed': False,
+        'home_win_probability': projection['probabilities']['home_win'],
+        'draw_probability': projection['probabilities']['draw'],
+        'away_win_probability': projection['probabilities']['away_win'],
+        'over25_probability': projection['probabilities']['over_2_5'],
+        'btts_probability': projection['probabilities']['btts'],
+        'expected': projection['expected'],
+        'likely_scores': [],
+        'possible_scorers': scorers,
+        'model_metadata': model_metadata,
+        'features_snapshot': projection['features'],
+        'published': True,
+        'updated_at': datetime.now(timezone.utc).isoformat(),
+    }
+    _persist_prediction(supabase, record)
+    return record
+
+
 async def refresh_prediction(
     fixture_id: int,
     *,
@@ -258,6 +635,13 @@ async def refresh_prediction(
         raise PredictionInputError('The stored fixture has no valid league.') from exc
     if stored_league_id in BASELINE_LEAGUES:
         return await _refresh_statistical_baseline(
+            fixture_id=fixture_id,
+            fixture_row=stored_fixture,
+            repository=repository,
+            supabase=supabase,
+        )
+    if stored_league_id in CALENDAR_ONLY_LEAGUE_IDS:
+        return await _refresh_calendar_profile_fallback(
             fixture_id=fixture_id,
             fixture_row=stored_fixture,
             repository=repository,

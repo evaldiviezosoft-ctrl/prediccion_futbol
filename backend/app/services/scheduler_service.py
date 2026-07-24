@@ -5,6 +5,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import get_settings
 from app.services.job_service import sync_and_predict
@@ -45,19 +46,33 @@ def start_scheduler() -> AsyncIOScheduler | None:
         return None
 
     scheduler = AsyncIOScheduler(timezone=local_timezone)
+    trigger = CronTrigger(
+        hour=settings.scheduler_daily_hour,
+        minute=settings.scheduler_daily_minute,
+        timezone=local_timezone,
+    )
+    job_options: dict[str, object] = {
+        'id': 'sync-and-predict',
+        'replace_existing': True,
+        'coalesce': True,
+        'max_instances': 1,
+    }
+    if settings.scheduler_run_on_startup:
+        job_options['next_run_time'] = datetime.now(local_timezone)
     scheduler.add_job(
         _scheduled_cycle,
-        trigger='interval',
-        minutes=settings.scheduler_interval_minutes,
-        id='sync-and-predict',
-        replace_existing=True,
-        coalesce=True,
-        max_instances=1,
-        next_run_time=datetime.now(local_timezone),
+        trigger=trigger,
+        **job_options,
     )
     scheduler.start()
     _scheduler = scheduler
-    logger.info('Prediction scheduler started.')
+    logger.info(
+        'Prediction scheduler started: daily at %02d:%02d %s; run_on_startup=%s.',
+        settings.scheduler_daily_hour,
+        settings.scheduler_daily_minute,
+        settings.default_timezone,
+        settings.scheduler_run_on_startup,
+    )
     return scheduler
 
 

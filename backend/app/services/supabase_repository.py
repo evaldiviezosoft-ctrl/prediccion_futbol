@@ -273,6 +273,78 @@ class SupabaseRepository:
             order_by=('kickoff', False),
         )
 
+    async def team_by_api_id(self, api_team_id: int) -> dict[str, Any] | None:
+        if api_team_id < 1:
+            raise ValueError('api_team_id must be positive')
+        rows = await self._select(
+            'teams',
+            columns='id,api_team_id,name,code,country,founded,national,logo_url',
+            equals={'api_team_id': int(api_team_id)},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def historical_finished_fixtures_for_team(
+        self,
+        *,
+        api_team_id: int,
+        kickoff: str,
+        statuses: Iterable[str] = PLAYED_FIXTURE_STATUSES,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Read a club's stored history across configured and targeted leagues."""
+
+        if api_team_id < 1:
+            raise ValueError('api_team_id must be positive')
+        if not 1 <= limit <= 1000:
+            raise ValueError('limit must be between 1 and 1000')
+        columns = (
+            'id,league_id,season,kickoff,fixture_date_utc,status_short,'
+            'home_team_id,away_team_id,home_team_ref_id,away_team_ref_id,'
+            'home_goals,away_goals'
+        )
+        common = {
+            'columns': columns,
+            'in_values': {'status_short': tuple(sorted(statuses))},
+            'lt_values': {'kickoff': kickoff},
+            'order_by': ('kickoff', True),
+            'limit': int(limit),
+        }
+        # The Supabase client is synchronous underneath and reuses one httpx
+        # connection pool. Concurrent ``to_thread`` reads against that shared
+        # client can fail intermittently on Windows with WSAEWOULDBLOCK.
+        home_rows = await self._select(
+            'fixtures',
+            equals={'home_team_id': int(api_team_id)},
+            **common,
+        )
+        away_rows = await self._select(
+            'fixtures',
+            equals={'away_team_id': int(api_team_id)},
+            **common,
+        )
+        merged = {
+            int(row['id']): row
+            for row in [*home_rows, *away_rows]
+            if row.get('id') is not None
+        }
+
+        def kickoff_value(row: Mapping[str, Any]) -> float:
+            value = row.get('kickoff') or row.get('fixture_date_utc')
+            try:
+                parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except (TypeError, ValueError):
+                return 0.0
+
+        return sorted(
+            merged.values(),
+            key=lambda row: (kickoff_value(row), int(row['id'])),
+            reverse=True,
+        )[:limit]
+
     async def team_statistics_for_fixtures(
         self,
         fixture_ids: Iterable[int],
@@ -380,6 +452,171 @@ class SupabaseRepository:
             },
             on_conflict='id',
         )
+
+    async def ensure_targeted_competition(
+        self,
+        league: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Resolve the minimal competition row carried by a fixture payload.
+
+        Targeted team history often belongs to a domestic league that is not in
+        the global synchronization catalog. Such rows are disabled by default:
+        they can own normalized fixtures but cannot accidentally make a later
+        generic sync download the complete league.
+        """
+
+        try:
+            api_league_id = int(league['id'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('Fixture league must include a positive API ID.') from exc
+        if api_league_id < 1:
+            raise ValueError('Fixture league must include a positive API ID.')
+        name = str(league.get('name') or '').strip()
+        if not name:
+            raise ValueError('Fixture league must include a name.')
+
+        existing = await self._select(
+            'competitions',
+            equals={'api_league_id': api_league_id},
+            limit=1,
+        )
+        if existing:
+            return existing[0]
+
+        provider_type = str(league.get('type') or '').strip().lower()
+        competition_type = (
+            provider_type if provider_type in {'league', 'cup'} else 'league'
+        )
+        country = (
+            str(league.get('country') or 'International').strip()
+            or 'International'
+        )
+        row = {
+            'api_league_id': api_league_id,
+            'internal_code': f'api_{api_league_id}',
+            'name': name,
+            'country': country,
+            'competition_type': competition_type,
+            'logo_url': league.get('logo'),
+            'enabled': False,
+            'last_synced_at': _utc_now(),
+        }
+        rows = await self._upsert(
+            'competitions',
+            row,
+            on_conflict='api_league_id',
+            select='*',
+        )
+        if rows:
+            return rows[0]
+        selected = await self._select(
+            'competitions',
+            equals={'api_league_id': api_league_id},
+            limit=1,
+        )
+        if not selected:
+            raise RuntimeError(
+                f'Targeted competition api_{api_league_id} was not returned after upsert.'
+            )
+        return selected[0]
+
+    async def persist_team_metadata(
+        self,
+        payload: Mapping[str, Any],
+    ) -> dict[str, int | None]:
+        """Upsert optional `/teams?id=...` metadata without requiring a migration."""
+
+        team = payload.get('team')
+        if not isinstance(team, Mapping):
+            raise ValueError('Team metadata payload has no team object.')
+        try:
+            api_team_id = int(team['id'])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError('Team metadata payload has no positive team ID.') from exc
+        name = str(team.get('name') or '').strip()
+        if api_team_id < 1 or not name:
+            raise ValueError('Team metadata payload has an invalid identity.')
+
+        def optional_text(value: Any) -> str | None:
+            normalized = str(value or '').strip()
+            return normalized or None
+
+        try:
+            founded = int(team['founded']) if team.get('founded') is not None else None
+        except (TypeError, ValueError):
+            founded = None
+        if founded is not None and not 1800 <= founded <= 2100:
+            founded = None
+        team_row = {
+            key: value
+            for key, value in {
+                'api_team_id': api_team_id,
+                'name': name,
+                'code': optional_text(team.get('code')),
+                'country': optional_text(team.get('country')),
+                'founded': founded,
+                'national': (
+                    team.get('national')
+                    if isinstance(team.get('national'), bool)
+                    else None
+                ),
+                'logo_url': optional_text(team.get('logo')),
+            }.items()
+            if value is not None
+        }
+        stored_teams = await self._upsert(
+            'teams',
+            team_row,
+            on_conflict='api_team_id',
+            select='id',
+        )
+
+        api_venue_id: int | None = None
+        venue = payload.get('venue')
+        if isinstance(venue, Mapping) and venue.get('id') is not None:
+            try:
+                candidate_venue_id = int(venue['id'])
+            except (TypeError, ValueError):
+                candidate_venue_id = 0
+            if candidate_venue_id > 0:
+                api_venue_id = candidate_venue_id
+                try:
+                    capacity = (
+                        int(venue['capacity'])
+                        if venue.get('capacity') is not None
+                        else None
+                    )
+                except (TypeError, ValueError):
+                    capacity = None
+                if capacity is not None and capacity < 0:
+                    capacity = None
+                venue_row = {
+                    key: value
+                    for key, value in {
+                        'api_venue_id': api_venue_id,
+                        'name': optional_text(venue.get('name')),
+                        'city': optional_text(venue.get('city')),
+                        'address': optional_text(venue.get('address')),
+                        'capacity': capacity,
+                        'surface': optional_text(venue.get('surface')),
+                        'image_url': optional_text(venue.get('image')),
+                    }.items()
+                    if value is not None
+                }
+                await self._upsert(
+                    'venues',
+                    venue_row,
+                    on_conflict='api_venue_id',
+                )
+        return {
+            'api_team_id': api_team_id,
+            'team_ref_id': (
+                int(stored_teams[0]['id'])
+                if stored_teams and stored_teams[0].get('id') is not None
+                else None
+            ),
+            'api_venue_id': api_venue_id,
+        }
 
     async def upsert_competition_resolution(self, resolution: Any) -> dict[str, Any]:
         data = _as_dict(resolution)
@@ -908,6 +1145,36 @@ class SupabaseRepository:
         )
         return {int(row['api_fixture_id']) for row in rows}
 
+    async def fixture_ids_with_team_statistics(
+        self,
+        fixture_ids: Sequence[int],
+    ) -> set[int]:
+        """Return fixtures that already have usable normalized team statistics.
+
+        Reading the normalized table is deliberately stricter than trusting a
+        provider payload flag: an empty ``statistics: []`` response does not
+        suppress a future retry.
+        """
+
+        ids = sorted({int(value) for value in fixture_ids if int(value) > 0})
+        completed: set[int] = set()
+        for index in range(0, len(ids), POSTGREST_IN_FILTER_CHUNK_SIZE):
+            rows = await self._select(
+                'fixture_team_statistics',
+                columns='fixture_id',
+                in_values={
+                    'fixture_id': ids[
+                        index:index + POSTGREST_IN_FILTER_CHUNK_SIZE
+                    ]
+                },
+            )
+            completed.update(
+                int(row['fixture_id'])
+                for row in rows
+                if row.get('fixture_id') is not None
+            )
+        return completed
+
     async def list_pending_fixture_details(
         self,
         *,
@@ -1104,24 +1371,22 @@ class SupabaseRepository:
         )
 
     async def sync_progress(self) -> dict[str, Any]:
-        statuses, seasons, logs = await asyncio.gather(
-            self._select(
-                'api_sync_status',
-                gte_values={'season': SYNC_FROM_SEASON},
-                lte_values={'season': SYNC_TO_SEASON},
-                order_by=('id', False),
-            ),
-            self._select(
-                'competition_seasons',
-                gte_values={'season': SYNC_FROM_SEASON},
-                lte_values={'season': SYNC_TO_SEASON},
-                order_by=('id', False),
-            ),
-            self._select(
-                'api_request_logs',
-                order_by=('requested_at', True),
-                limit=1,
-            ),
+        statuses = await self._select(
+            'api_sync_status',
+            gte_values={'season': SYNC_FROM_SEASON},
+            lte_values={'season': SYNC_TO_SEASON},
+            order_by=('id', False),
+        )
+        seasons = await self._select(
+            'competition_seasons',
+            gte_values={'season': SYNC_FROM_SEASON},
+            lte_values={'season': SYNC_TO_SEASON},
+            order_by=('id', False),
+        )
+        logs = await self._select(
+            'api_request_logs',
+            order_by=('requested_at', True),
+            limit=1,
         )
         complete = sum(bool(row.get('fixture_details_downloaded')) for row in statuses)
         statistics_complete = sum(bool(row.get('statistics_downloaded')) for row in statuses)

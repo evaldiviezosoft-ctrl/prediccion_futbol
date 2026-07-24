@@ -63,10 +63,10 @@ def load_competition_config(path: Path | str) -> CompetitionConfig:
         config = CompetitionConfig.model_validate(raw)
     except ValidationError as exc:
         raise CompetitionResolutionError('configuration', 'invalid competition definitions') from exc
-    if len(config.competitions) != 10:
+    if not config.competitions:
         raise CompetitionResolutionError(
             'configuration',
-            f'exactly 10 competitions are required, found {len(config.competitions)}',
+            'at least one competition is required',
         )
     return config
 

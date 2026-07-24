@@ -78,6 +78,7 @@ Los archivos preparados son:
 - `prediccion_futbol/config/dev.web.json`: backend en `127.0.0.1`.
 - `prediccion_futbol/config/dev.android.json`: backend en `10.0.2.2`, dirección
   especial del emulador Android.
+- `prediccion_futbol/config/production.json`: backend HTTPS desplegado en Railway.
 - `prediccion_futbol/config/production.example.json`: plantilla para HTTPS.
 
 Solo contienen `BACKEND_URL`; Flutter ya no abre una conexión directa a
@@ -101,6 +102,13 @@ flutter run --dart-define-from-file=config/dev.android.json
 
 Para un teléfono físico, reemplaza `10.0.2.2` por la IP local del equipo que
 ejecuta FastAPI. En producción, `BACKEND_URL` debe usar HTTPS.
+
+APK de producción:
+
+```powershell
+cd prediccion_futbol
+flutter build apk --release --dart-define-from-file=config/production.json
+```
 
 ### 3. Sincronizar datos y calcular predicciones
 
@@ -131,10 +139,28 @@ Invoke-RestMethod `
   -Headers @{ 'X-Admin-Token' = $env:FOOTBALL_ADMIN_TOKEN }
 ```
 
-Para desarrollo se puede activar el ciclo periódico con
-`ENABLE_SCHEDULER=true`. En un despliegue con varias réplicas conviene mantenerlo
-desactivado y llamar el endpoint desde un cron externo único, evitando ciclos
-duplicados y consumo innecesario de la cuota de API-Football.
+Para activar la sincronización diaria del backend:
+
+```dotenv
+ENABLE_SCHEDULER=true
+SCHEDULER_RUN_ON_STARTUP=false
+SCHEDULER_DAILY_HOUR=0
+SCHEDULER_DAILY_MINUTE=5
+DEFAULT_TIMEZONE=America/Lima
+```
+
+De forma predeterminada, arrancar o reiniciar FastAPI no consume cuota: el
+primer ciclo espera hasta las `00:05` de Lima y luego se ejecuta una vez al día.
+`SCHEDULER_RUN_ON_STARTUP=true` habilita una ejecución inmediata de manera
+explícita. El programador reutiliza una sola instancia y cada trabajo admite
+como máximo una ejecución simultánea. Los límites
+`API_DAILY_SAFETY_RESERVE` y `API_MAX_REQUESTS_PER_RUN` siguen protegiendo la
+cuota gratuita.
+
+El programador vive dentro del proceso FastAPI: si el equipo o servidor está
+apagado, no puede sincronizar. En un despliegue con varias réplicas se debe
+habilitar solo en una de ellas o mantenerlo desactivado y llamar el endpoint
+desde un cron externo único, evitando ciclos duplicados.
 
 El plan probado permite `season=2022`, `2023` y `2024`; las temporadas 2021,
 2025 y 2026 están registradas como no disponibles. `config/demo.json` sigue

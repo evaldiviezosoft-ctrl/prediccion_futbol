@@ -10,8 +10,15 @@ from app.core.config import get_settings
 from app.core.errors import BackendError, DatabaseError, FixtureNotFoundError
 from app.db.supabase_client import get_supabase
 from app.routes.dependencies import require_admin
+from app.services.calendar_visibility import (
+    filter_visible_calendar_fixtures,
+    local_team_country,
+)
 from app.services.fixture_normalizer import UPCOMING_FIXTURE_STATUSES
-from app.services.fixture_service import SUPPORTED_LEAGUE_IDS, sync_fixtures_by_date
+from app.services.fixture_service import (
+    SUPPORTED_LEAGUE_IDS,
+    sync_fixtures_by_date,
+)
 
 router = APIRouter(prefix='/fixtures', tags=['fixtures'])
 _TEAM_LOGO_CACHE: dict[int, tuple[bytes, str]] = {}
@@ -42,6 +49,7 @@ def upcoming(
             .execute()
         )
         rows = [dict(row) for row in (response.data or [])]
+        rows = filter_visible_calendar_fixtures(database, rows)
         if not rows:
             return []
 
@@ -54,7 +62,7 @@ def upcoming(
         })
         league_response = (
             database.table('leagues')
-            .select('id,code,name')
+            .select('id,code,name,country')
             .in_('id', league_ids)
             .execute()
         )
@@ -67,7 +75,7 @@ def upcoming(
         )
         team_response = (
             database.table('teams')
-            .select('api_team_id,logo_url')
+            .select('api_team_id,country,logo_url')
             .in_('api_team_id', team_ids)
             .execute()
         )
@@ -78,8 +86,8 @@ def upcoming(
 
     leagues = {int(row['id']): row for row in (league_response.data or [])}
     predictions = {int(row['fixture_id']): row for row in (prediction_response.data or [])}
-    team_logos = {
-        int(row['api_team_id']): row.get('logo_url')
+    teams = {
+        int(row['api_team_id']): dict(row)
         for row in (team_response.data or [])
     }
     for row in rows:
@@ -90,8 +98,29 @@ def upcoming(
         row['prediction_available'] = prediction is not None
         row['prediction_stage'] = prediction.get('stage') if prediction else None
         row['prediction_model_available'] = int(row['league_id']) in SUPPORTED_LEAGUE_IDS
-        row['home_team_logo_url'] = team_logos.get(int(row['home_team_id']))
-        row['away_team_logo_url'] = team_logos.get(int(row['away_team_id']))
+        row['prediction_fallback_available'] = bool(
+            row.get('prediction_fallback_available', False)
+        )
+        home_team = teams.get(int(row['home_team_id']), {})
+        away_team = teams.get(int(row['away_team_id']), {})
+        league_country = league.get('country')
+        modeled_league_country = (
+            league_country
+            if int(row['league_id']) in SUPPORTED_LEAGUE_IDS
+            else None
+        )
+        row['home_team_country'] = (
+            home_team.get('country')
+            or local_team_country(row['home_team_name'])
+            or modeled_league_country
+        )
+        row['away_team_country'] = (
+            away_team.get('country')
+            or local_team_country(row['away_team_name'])
+            or modeled_league_country
+        )
+        row['home_team_logo_url'] = home_team.get('logo_url')
+        row['away_team_logo_url'] = away_team.get('logo_url')
         row['home_team_logo_proxy_path'] = (
             f"/fixtures/team-logo/{int(row['home_team_id'])}"
             if row['home_team_logo_url']

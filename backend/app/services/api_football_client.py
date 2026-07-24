@@ -219,7 +219,9 @@ class ApiFootballClient:
         response = payload.get('response')
         if response is None:
             return []
-        if not isinstance(response, list) or not all(isinstance(item, dict) for item in response):
+        if not isinstance(response, list) or not all(
+            isinstance(item, dict) for item in response
+        ):
             raise ApiFootballError('API-Football returned an invalid leagues response.')
         return response
 
@@ -254,9 +256,81 @@ class ApiFootballClient:
         response = payload.get('response')
         if response is None:
             return []
-        if not isinstance(response, list) or not all(isinstance(item, dict) for item in response):
+        if not isinstance(response, list) or not all(
+            isinstance(item, dict) for item in response
+        ):
             raise ApiFootballError('API-Football returned an invalid fixtures response.')
         return response
+
+    async def fixtures_for_team(
+        self,
+        team: int,
+        *,
+        last: int | None = None,
+        season: int | None = None,
+        status: str | None = None,
+        timezone_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Fetch a bounded recent history for one provider team.
+
+        This intentionally uses the team-specific `/fixtures?team=...&last=...`
+        query. It is the low-quota alternative to downloading every fixture in
+        every domestic league just to seed one missing club profile.
+        """
+
+        if team < 1:
+            raise ValueError('team must be positive')
+        if (last is None) == (season is None):
+            raise ValueError('exactly one of last or season is required')
+        if last is not None and not 1 <= last <= 100:
+            raise ValueError('last must be between 1 and 100')
+        if season is not None and not 2000 <= season <= 2100:
+            raise ValueError('season must be between 2000 and 2100')
+        params: dict[str, Any] = {
+            'team': team,
+            'timezone': timezone_name or self.settings.api_timezone,
+        }
+        if last is not None:
+            params['last'] = last
+        if season is not None:
+            params['season'] = season
+        if status:
+            params['status'] = status
+        payload = await self.get('/fixtures', params)
+        response = payload.get('response')
+        if response is None:
+            return []
+        if not isinstance(response, list) or not all(
+            isinstance(item, dict) for item in response
+        ):
+            raise ApiFootballError(
+                'API-Football returned an invalid team fixture response.'
+            )
+        return response
+
+    async def team_by_id(self, team: int) -> dict[str, Any] | None:
+        """Return optional club and venue metadata for one exact team ID."""
+
+        if team < 1:
+            raise ValueError('team must be positive')
+        payload = await self.get('/teams', {'id': team})
+        response = payload.get('response')
+        if response is None:
+            return None
+        if not isinstance(response, list) or not all(
+            isinstance(item, dict) for item in response
+        ):
+            raise ApiFootballError('API-Football returned an invalid team response.')
+        for item in response:
+            provider_team = item.get('team')
+            if not isinstance(provider_team, Mapping):
+                continue
+            try:
+                if int(provider_team.get('id')) == team:
+                    return item
+            except (TypeError, ValueError):
+                continue
+        return None
 
     async def fixture_details(
         self,
