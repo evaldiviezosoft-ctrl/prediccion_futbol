@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:http/http.dart' as http;
 
 import '../core/app_config.dart';
+import '../models/ai_calibration.dart';
 import '../models/backend_health.dart';
 import '../models/fixture_summary.dart';
 import '../models/prediction.dart';
@@ -105,6 +106,11 @@ class FootballRepository implements FootballDataSource {
     return _pollPrediction(fixtureId);
   }
 
+  @override
+  Stream<AiCalibrationResult> watchAiCalibration(int fixtureId) {
+    return _pollAiCalibration(fixtureId);
+  }
+
   Stream<Prediction?> _pollPrediction(int fixtureId) async* {
     var consecutiveFailures = 0;
     while (true) {
@@ -139,6 +145,56 @@ class FootballRepository implements FootballDataSource {
         }
         consecutiveFailures = 0;
         await Future<void>.delayed(_pollInterval);
+      } on FootballRepositoryException catch (error) {
+        consecutiveFailures += 1;
+        if (!_isTransient(error.kind) ||
+            consecutiveFailures >= _maxTransientFailures) {
+          rethrow;
+        }
+        final multiplier = 1 << (consecutiveFailures - 1);
+        await Future<void>.delayed(_retryBaseDelay * multiplier);
+      }
+    }
+  }
+
+  Stream<AiCalibrationResult> _pollAiCalibration(int fixtureId) async* {
+    var consecutiveFailures = 0;
+    while (true) {
+      try {
+        final response = await _get(
+          '/predictions/$fixtureId/analysis',
+          timeout: const Duration(seconds: 8),
+        );
+        if (response.statusCode == 200) {
+          late final AiCalibrationResult result;
+          try {
+            result = AiCalibrationResult.fromJson(
+              Map<String, dynamic>.from(jsonDecode(response.body) as Map),
+            );
+          } catch (_) {
+            throw const FootballRepositoryException(
+              'El análisis IA llegó con un formato inesperado.',
+              RepositoryErrorKind.invalidData,
+            );
+          }
+          yield result;
+          consecutiveFailures = 0;
+          if (!result.shouldPoll) return;
+          final retryAfter = result.retryAfterSeconds;
+          await Future<void>.delayed(
+            retryAfter == null ? _pollInterval : Duration(seconds: retryAfter),
+          );
+        } else {
+          throw FootballRepositoryException(
+            _messageFromResponse(
+              response,
+              fallback: 'No se pudo consultar el análisis contextual.',
+            ),
+            response.statusCode == 503
+                ? RepositoryErrorKind.configuration
+                : RepositoryErrorKind.server,
+          );
+        }
       } on FootballRepositoryException catch (error) {
         consecutiveFailures += 1;
         if (!_isTransient(error.kind) ||

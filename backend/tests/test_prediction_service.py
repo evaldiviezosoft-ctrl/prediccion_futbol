@@ -76,6 +76,8 @@ class RecordingTable:
 
     def upsert(self, payload, on_conflict=None):
         self.db.operations.append(('upsert', self.name, payload))
+        if self.name == 'predictions':
+            self.db.predictions[int(payload['fixture_id'])] = dict(payload)
         return self
 
     def insert(self, payload):
@@ -87,12 +89,17 @@ class RecordingTable:
             fixture_id = int(self.filters['id'])
             row = self.db.fixtures.get(fixture_id)
             return SimpleNamespace(data=[row] if row else [])
+        if self.action == 'select' and self.name == 'predictions':
+            fixture_id = int(self.filters['fixture_id'])
+            row = self.db.predictions.get(fixture_id)
+            return SimpleNamespace(data=[dict(row)] if row else [])
         return SimpleNamespace(data=[])
 
 
 class RecordingDb:
     def __init__(self):
         self.operations = []
+        self.predictions = {}
         self.fixtures = {
             fixture_id: stored_fixture_row(fixture_id)
             for fixture_id in (123, 321)
@@ -293,6 +300,42 @@ def test_south_american_refresh_is_db_only_and_persists_existing_contract(monkey
     assert record['model_metadata']['possible_assistants'] == []
     assert record['expected']['home_corners'] == 5
     assert record['possible_scorers'] == []
+
+
+def test_db_only_refresh_reuses_semantically_identical_persisted_prediction(
+    monkeypatch,
+):
+    db = RecordingDb()
+    fixture = stored_fixture_row(779, league_id=281)
+    fixture['home_team_name'] = 'Sporting Cristal'
+    fixture['away_team_name'] = 'Alianza Lima'
+    repository = BaselineRepository(fixture)
+    monkeypatch.setattr(
+        prediction_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+
+    first = asyncio.run(
+        prediction_service.refresh_prediction(779, db_client=db)
+    )
+    original_updated_at = first['updated_at']
+    db.predictions[779]['kickoff'] = '2099-08-22T18:00:00Z'
+
+    second = asyncio.run(
+        prediction_service.refresh_prediction(779, db_client=db)
+    )
+
+    assert [
+        (operation, table)
+        for operation, table, _payload in db.operations
+    ] == [
+        ('upsert', 'predictions'),
+        ('insert', 'prediction_versions'),
+    ]
+    assert second == db.predictions[779]
+    assert second['updated_at'] == original_updated_at
+    assert second['kickoff'] == '2099-08-22T18:00:00Z'
 
 
 @pytest.mark.parametrize(

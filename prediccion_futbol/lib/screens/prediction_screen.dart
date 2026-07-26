@@ -1,11 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
+import '../models/ai_calibration.dart';
 import '../models/fixture_summary.dart';
 import '../models/prediction.dart';
 import '../repositories/football_data_source.dart';
 import '../theme/app_theme.dart';
 import '../widgets/team_mark.dart';
+
+part '../widgets/ai_calibration_section.dart';
 
 class PredictionScreen extends StatefulWidget {
   const PredictionScreen({
@@ -22,20 +25,36 @@ class PredictionScreen extends StatefulWidget {
 }
 
 class _PredictionScreenState extends State<PredictionScreen> {
-  Stream<Prediction?>? _stream;
+  Stream<Prediction?>? _predictionStream;
+  Stream<AiCalibrationResult>? _aiCalibrationStream;
 
   @override
   void initState() {
     super.initState();
     if (widget.fixture.predictionAccessAvailable) {
-      _stream = widget.repository.watchPrediction(widget.fixture.id);
+      _predictionStream = widget.repository.watchPrediction(widget.fixture.id);
+      _aiCalibrationStream = widget.repository.watchAiCalibration(
+        widget.fixture.id,
+      );
     }
   }
 
-  void _retry() {
+  void _retryPrediction() {
+    if (!widget.fixture.predictionAccessAvailable) return;
+    setState(() {
+      _predictionStream = widget.repository.watchPrediction(widget.fixture.id);
+      _aiCalibrationStream = widget.repository.watchAiCalibration(
+        widget.fixture.id,
+      );
+    });
+  }
+
+  void _retryAiCalibration() {
     if (!widget.fixture.predictionAccessAvailable) return;
     setState(
-      () => _stream = widget.repository.watchPrediction(widget.fixture.id),
+      () => _aiCalibrationStream = widget.repository.watchAiCalibration(
+        widget.fixture.id,
+      ),
     );
   }
 
@@ -55,7 +74,7 @@ class _PredictionScreenState extends State<PredictionScreen> {
                       'Esta competición ya tiene datos, pero todavía no dispone de un modelo predictivo validado.',
                 )
               : StreamBuilder<Prediction?>(
-                  stream: _stream!,
+                  stream: _predictionStream!,
                   builder: (context, snapshot) {
                     if (snapshot.hasError) {
                       return _PredictionState(
@@ -63,7 +82,7 @@ class _PredictionScreenState extends State<PredictionScreen> {
                         title: 'No pudimos escuchar la predicción',
                         message: snapshot.error.toString(),
                         actionLabel: 'Reintentar',
-                        onAction: _retry,
+                        onAction: _retryPrediction,
                       );
                     }
                     if (snapshot.connectionState == ConnectionState.waiting) {
@@ -82,12 +101,14 @@ class _PredictionScreenState extends State<PredictionScreen> {
                         message:
                             'El partido ya está sincronizado. El modelo publicará el resultado cuando el backend complete el cálculo.',
                         actionLabel: 'Comprobar de nuevo',
-                        onAction: _retry,
+                        onAction: _retryPrediction,
                       );
                     }
                     return _PredictionContent(
                       fixture: widget.fixture,
                       prediction: prediction,
+                      aiCalibrationStream: _aiCalibrationStream!,
+                      onRetryAiCalibration: _retryAiCalibration,
                     );
                   },
                 ),
@@ -98,10 +119,17 @@ class _PredictionScreenState extends State<PredictionScreen> {
 }
 
 class _PredictionContent extends StatelessWidget {
-  const _PredictionContent({required this.fixture, required this.prediction});
+  const _PredictionContent({
+    required this.fixture,
+    required this.prediction,
+    required this.aiCalibrationStream,
+    required this.onRetryAiCalibration,
+  });
 
   final FixtureSummary fixture;
   final Prediction prediction;
+  final Stream<AiCalibrationResult> aiCalibrationStream;
+  final VoidCallback onRetryAiCalibration;
 
   @override
   Widget build(BuildContext context) {
@@ -137,6 +165,13 @@ class _PredictionContent extends StatelessWidget {
             title: 'Predicción 1X2 (probabilidad)',
             child: _ProbabilityPanel(prediction: prediction),
           ),
+        _AiCalibrationSlot(
+          stream: aiCalibrationStream,
+          homeTeam: prediction.homeTeam,
+          awayTeam: prediction.awayTeam,
+          showProbabilityComparison: !isSingleTeamFallback,
+          onRetry: onRetryAiCalibration,
+        ),
         if (prediction.goalLines.isNotEmpty)
           _Section(
             icon: Icons.sports_soccer,

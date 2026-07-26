@@ -39,3 +39,23 @@ def test_secret_values_are_masked_in_settings_representation():
     settings = Settings(_env_file=None, supabase_secret_key=secret)
 
     assert secret not in repr(settings)
+
+
+def test_openai_defaults_match_the_configured_quality_first_contract():
+    key = 'sk-test-only-012345678901234567890'
+    settings = Settings(_env_file=None, openai_api_key=key)
+
+    assert settings.openai_configured is True
+    assert settings.require_openai_api_key() == key
+    assert settings.openai_model == 'gpt-5.6-sol'
+    assert settings.openai_reasoning_effort == 'max'
+    assert key not in repr(settings)
+
+
+def test_placeholder_openai_key_does_not_enable_optional_calibration():
+    settings = Settings(
+        _env_file=None,
+        openai_api_key='REEMPLAZAR_SOLO_BACKEND',
+    )
+
+    assert settings.openai_configured is False

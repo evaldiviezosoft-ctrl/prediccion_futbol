@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:prediccion_futbol/models/ai_calibration.dart';
 import 'package:prediccion_futbol/models/backend_health.dart';
 import 'package:prediccion_futbol/models/fixture_summary.dart';
 import 'package:prediccion_futbol/models/prediction.dart';
@@ -7,15 +8,31 @@ import 'package:prediccion_futbol/repositories/football_data_source.dart';
 import 'package:prediccion_futbol/screens/prediction_screen.dart';
 
 class _CountingRepository implements FootballDataSource {
-  _CountingRepository([this.prediction]);
+  _CountingRepository([this.prediction, this.aiCalibration]);
 
   final Prediction? prediction;
+  final AiCalibrationResult? aiCalibration;
   int watchCalls = 0;
+  int aiWatchCalls = 0;
 
   @override
   Stream<Prediction?> watchPrediction(int fixtureId) {
     watchCalls += 1;
     return Stream<Prediction?>.value(prediction);
+  }
+
+  @override
+  Stream<AiCalibrationResult> watchAiCalibration(int fixtureId) {
+    aiWatchCalls += 1;
+    return Stream<AiCalibrationResult>.value(
+      aiCalibration ??
+          AiCalibrationResult(
+            fixtureId: fixtureId,
+            status: AiCalibrationStatus.unavailable,
+            isStale: false,
+            safeMessage: 'Análisis no disponible para la prueba.',
+          ),
+    );
   }
 
   @override
@@ -132,6 +149,81 @@ Prediction _fallbackPrediction({bool singleTeamProfile = true}) =>
             : <String>['home', 'away'],
       },
     });
+
+AiCalibrationResult _aiResult(
+  AiCalibrationStatus status, {
+  bool noBet = false,
+}) {
+  if (status != AiCalibrationStatus.updated) {
+    return AiCalibrationResult(
+      fixtureId: 1,
+      status: status,
+      isStale: false,
+      safeMessage: status == AiCalibrationStatus.pending
+          ? 'Calibración en cola.'
+          : 'No fue posible completar el análisis.',
+    );
+  }
+  return AiCalibrationResult(
+    fixtureId: 1,
+    status: status,
+    generatedAt: DateTime.now(),
+    isStale: false,
+    analysis: AiCalibrationAnalysis(
+      matchType: 'official',
+      baseProbabilities: const AiProbabilityTriplet(
+        home: .39,
+        draw: .27,
+        away: .34,
+      ),
+      adjustedProbabilities: const AiProbabilityTriplet(
+        home: .36,
+        draw: .29,
+        away: .35,
+      ),
+      adjustments: const [
+        AiAdjustment(
+          factor: 'preparation',
+          detail: 'El visitante llega con mejor continuidad.',
+          evidence: 'team_history_summary',
+          benefitedSide: 'away',
+          impactPercentagePoints: 2,
+        ),
+      ],
+      preparationComparison: const [
+        AiContextDetail(label: 'Ventaja', value: 'Visitante'),
+      ],
+      rotationEffect: const [
+        AiContextDetail(label: 'Local', value: 'Rotación posible'),
+      ],
+      projections: const [
+        AiProjection(
+          metric: 'Goles',
+          home: AiProjectionRange(minimum: 0, maximum: 2),
+          away: AiProjectionRange(minimum: 1, maximum: 2),
+          total: AiProjectionRange(minimum: 1, maximum: 4),
+        ),
+      ],
+      recommendedMarket: AiMarketRecommendation(
+        market: noBet ? 'no_bet' : 'over_1_5',
+        confidence: noBet ? 'no_bet' : 'medium',
+        justification: noBet
+            ? 'La evidencia no permite recomendar un mercado.'
+            : 'Es el mercado con mayor respaldo.',
+        marketDataAvailable: false,
+        minimumValueOdds: noBet ? null : 1.48,
+      ),
+      conservativeAlternative: null,
+      risks: const ['Alineaciones pendientes'],
+      missingData: const ['Cuotas recientes'],
+      possibleModelErrors: const ['Muestra reducida'],
+      refreshWithLineups: true,
+      dataQuality: 'medium',
+      lineupsConsidered: false,
+      modelLabel: 'Calibración contextual IA',
+    ),
+  );
+}
 
 void main() {
   testWidgets('una liga sin modelo no abre una suscripción', (tester) async {
@@ -370,4 +462,152 @@ void main() {
       expect(find.text('Marcadores probables'), findsNothing);
     },
   );
+
+  testWidgets('pending no oculta la predicción estadística base', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _baselinePrediction(),
+      _aiResult(AiCalibrationStatus.pending),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(fixture: _fixture(71), repository: repository),
+      ),
+    );
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+
+    expect(find.text('Predicción 1X2 (probabilidad)'), findsOneWidget);
+    await tester.scrollUntilVisible(
+      find.text('Calibración IA en preparación'),
+      300,
+    );
+    expect(
+      find.byKey(const ValueKey('ai-calibration-pending')),
+      findsOneWidget,
+    );
+    expect(find.text('39%'), findsAtLeastNWidgets(1));
+  });
+
+  testWidgets('muestra calibración, deltas, evidencia y mercado respaldado', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _baselinePrediction(),
+      _aiResult(AiCalibrationStatus.updated),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(fixture: _fixture(71), repository: repository),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text('Modelo base vs. calibración'),
+      300,
+    );
+    expect(
+      find.byKey(const ValueKey('ai-calibration-updated')),
+      findsOneWidget,
+    );
+    expect(find.text('-3 pp'), findsOneWidget);
+    expect(find.text('Factores y evidencia'), findsOneWidget);
+
+    await tester.scrollUntilVisible(
+      find.text('Mercado con mayor respaldo'),
+      300,
+    );
+    expect(find.text('Más de 1.5 goles'), findsOneWidget);
+    expect(find.text('Cuota teórica de referencia: 1.48'), findsOneWidget);
+    expect(
+      find.textContaining('aún no se ha comprobado una ventaja de mercado'),
+      findsOneWidget,
+    );
+    expect(find.textContaining('apuesta segura'), findsNothing);
+    expect(find.textContaining('no garantiza resultados'), findsOneWidget);
+  });
+
+  testWidgets('IA no compara 1X2 cuando solo existe un perfil histórico', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _fallbackPrediction(singleTeamProfile: true),
+      _aiResult(AiCalibrationStatus.updated),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(
+          fixture: _fixture(667, predictionFallbackAvailable: true),
+          repository: repository,
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.textContaining('No comparamos 1X2'),
+      300,
+    );
+    expect(find.text('Modelo base vs. calibración'), findsNothing);
+    expect(
+      find.textContaining('falta un perfil histórico suficiente'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets(
+    'un error de IA conserva la base y ofrece reintento independiente',
+    (tester) async {
+      final repository = _CountingRepository(
+        _baselinePrediction(),
+        _aiResult(AiCalibrationStatus.error),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PredictionScreen(fixture: _fixture(71), repository: repository),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Predicción 1X2 (probabilidad)'), findsOneWidget);
+      await tester.scrollUntilVisible(
+        find.text('No pudimos completar la calibración'),
+        300,
+      );
+      expect(
+        find.byKey(const ValueKey('ai-calibration-error')),
+        findsOneWidget,
+      );
+      expect(find.text('Comprobar estado'), findsOneWidget);
+    },
+  );
+
+  testWidgets('no_bet se presenta sin prometer una apuesta segura', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _baselinePrediction(),
+      _aiResult(AiCalibrationStatus.updated, noBet: true),
+    );
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(fixture: _fixture(71), repository: repository),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.scrollUntilVisible(
+      find.text('No hay una selección recomendable'),
+      300,
+    );
+    expect(find.text('No hay una selección recomendable'), findsOneWidget);
+    expect(find.textContaining('apuesta segura'), findsNothing);
+  });
 }

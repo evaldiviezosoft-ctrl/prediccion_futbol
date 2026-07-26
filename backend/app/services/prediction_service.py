@@ -50,6 +50,30 @@ from app.services.team_history_profile import build_team_history_profile
 
 logger = logging.getLogger(__name__)
 
+_PREDICTION_SEMANTIC_FIELDS = (
+    'fixture_id',
+    'league_id',
+    'league_code',
+    'home_team_id',
+    'away_team_id',
+    'home_team_name',
+    'away_team_name',
+    'kickoff',
+    'stage',
+    'lineups_confirmed',
+    'home_win_probability',
+    'draw_probability',
+    'away_win_probability',
+    'over25_probability',
+    'btts_probability',
+    'expected',
+    'likely_scores',
+    'possible_scorers',
+    'model_metadata',
+    'features_snapshot',
+    'published',
+)
+
 
 def _first(payload: dict[str, Any]) -> dict[str, Any]:
     response = payload.get('response') or []
@@ -92,8 +116,43 @@ def _prediction_stage(kickoff: datetime) -> str:
     return 'initial'
 
 
-def _persist_prediction(supabase: Any, record: dict[str, Any]) -> None:
+def _same_prediction(
+    stored: dict[str, Any],
+    candidate: dict[str, Any],
+) -> bool:
+    for field in _PREDICTION_SEMANTIC_FIELDS:
+        stored_value = stored.get(field)
+        candidate_value = candidate.get(field)
+        if field == 'kickoff':
+            try:
+                if _kickoff(stored_value) != _kickoff(candidate_value):
+                    return False
+                continue
+            except (TypeError, ValueError):
+                pass
+        if stored_value != candidate_value:
+            return False
+    return True
+
+
+def _persist_prediction(
+    supabase: Any,
+    record: dict[str, Any],
+    *,
+    preserve_if_unchanged: bool = False,
+) -> dict[str, Any]:
     try:
+        if preserve_if_unchanged:
+            response = (
+                supabase.table('predictions')
+                .select(','.join((*_PREDICTION_SEMANTIC_FIELDS, 'updated_at')))
+                .eq('fixture_id', record['fixture_id'])
+                .limit(1)
+                .execute()
+            )
+            rows = response.data or []
+            if rows and _same_prediction(rows[0], record):
+                return dict(rows[0])
         supabase.table('predictions').upsert(record, on_conflict='fixture_id').execute()
         supabase.table('prediction_versions').insert({
             'fixture_id': record['fixture_id'],
@@ -102,6 +161,7 @@ def _persist_prediction(supabase: Any, record: dict[str, Any]) -> None:
         }).execute()
     except Exception as exc:
         raise DatabaseError('Could not persist the prediction.') from exc
+    return record
 
 
 async def _refresh_statistical_baseline(
@@ -245,8 +305,11 @@ async def _refresh_statistical_baseline(
         'published': True,
         'updated_at': datetime.now(timezone.utc).isoformat(),
     }
-    _persist_prediction(supabase, record)
-    return record
+    return _persist_prediction(
+        supabase,
+        record,
+        preserve_if_unchanged=True,
+    )
 
 
 def _calendar_player_history_sources(
@@ -610,8 +673,11 @@ async def _refresh_calendar_profile_fallback(
         'published': True,
         'updated_at': datetime.now(timezone.utc).isoformat(),
     }
-    _persist_prediction(supabase, record)
-    return record
+    return _persist_prediction(
+        supabase,
+        record,
+        preserve_if_unchanged=True,
+    )
 
 
 async def refresh_prediction(

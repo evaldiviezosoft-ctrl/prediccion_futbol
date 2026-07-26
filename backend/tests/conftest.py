@@ -9,6 +9,7 @@ for variable in (
     'SUPABASE_SECRET_KEY',
     'SUPABASE_SERVICE_ROLE_KEY',
     'ADMIN_TOKEN',
+    'OPENAI_API_KEY',
 ):
     os.environ[variable] = ''
 os.environ['ENABLE_SCHEDULER'] = 'false'

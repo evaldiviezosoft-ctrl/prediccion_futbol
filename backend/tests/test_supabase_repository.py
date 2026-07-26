@@ -107,6 +107,48 @@ def test_select_without_limit_reads_every_postgrest_page():
     assert client.ranges == [(0, 999), (1000, 1999), (2000, 2999)]
 
 
+def test_ai_calibration_candidates_prioritize_never_calibrated_fixtures(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    predictions = [
+        {
+            'fixture_id': 1,
+            'kickoff': '2026-07-26T10:00:00+00:00',
+            'updated_at': '2026-07-25T10:00:00+00:00',
+        },
+        {
+            'fixture_id': 2,
+            'kickoff': '2026-07-26T11:00:00+00:00',
+            'updated_at': '2026-07-25T11:00:00+00:00',
+        },
+    ]
+    attempts = [{
+        'fixture_id': 1,
+        'attempt_number': 1,
+        'status': 'updated',
+        'retry_after': None,
+        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
+    }]
+
+    async def select(table, **_kwargs):
+        if table == 'predictions':
+            return predictions
+        if table == 'prediction_calibrations':
+            return attempts
+        raise AssertionError(table)
+
+    monkeypatch.setattr(repository, '_select', select)
+
+    rows = asyncio.run(repository.ai_calibration_candidates(
+        starts_at='2026-07-26T00:00:00+00:00',
+        ends_at='2026-07-27T00:00:00+00:00',
+        limit=1,
+    ))
+
+    assert [row['fixture_id'] for row in rows] == [2]
+
+
 class _FilteredQuery:
     def __init__(self, client):
         self.client = client
