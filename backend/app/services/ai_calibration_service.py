@@ -23,6 +23,7 @@ from app.schemas.ai_calibration import (
     MetricProjections,
     PreparationComparison,
     ProbabilityBps,
+    ProbableForecastPick,
     ProjectionRange,
     PublicAdjustment,
     PublicBetRecommendation,
@@ -1566,7 +1567,7 @@ def _stored_lineups_considered(attempt: Mapping[str, Any]) -> bool:
 def _stored_probable_forecast(
     attempt: Mapping[str, Any],
     prediction: Mapping[str, Any],
-) -> list[dict[str, Any]]:
+) -> list[ProbableForecastPick]:
     snapshot = attempt.get('input_snapshot')
     if isinstance(snapshot, Mapping):
         fixture = snapshot.get('fixture')
@@ -1595,8 +1596,14 @@ def _stored_probable_forecast(
                     },
                 })
                 if frozen:
-                    return frozen
-    return build_probable_forecast(prediction)
+                    return [
+                        ProbableForecastPick.model_validate(row)
+                        for row in frozen
+                    ]
+    return [
+        ProbableForecastPick.model_validate(row)
+        for row in build_probable_forecast(prediction)
+    ]
 
 
 async def _prepare_attempt(
@@ -2089,7 +2096,10 @@ async def get_ai_calibration_envelope(
             # While its replacement is queued, expose only today's safe base
             # calculation instead of reviving an outdated market.
             analysis = analysis.model_copy(update={
-                'probable_forecast': build_probable_forecast(prediction),
+                'probable_forecast': [
+                    ProbableForecastPick.model_validate(row)
+                    for row in build_probable_forecast(prediction)
+                ],
                 'forecast_finalized': analysis.lineups_considered,
             })
         elif not analysis.probable_forecast:
