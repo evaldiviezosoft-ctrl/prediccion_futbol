@@ -48,7 +48,9 @@ def test_openai_defaults_match_the_configured_quality_first_contract():
     assert settings.openai_configured is True
     assert settings.require_openai_api_key() == key
     assert settings.openai_model == 'gpt-5.6-sol'
-    assert settings.openai_reasoning_effort == 'max'
+    assert settings.openai_reasoning_effort == 'high'
+    assert settings.openai_max_output_tokens == 6_000
+    assert settings.ai_calibration_max_per_cycle == 5
     assert key not in repr(settings)
 
 

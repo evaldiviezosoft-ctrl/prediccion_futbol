@@ -142,7 +142,8 @@ def _persist_prediction(
     preserve_if_unchanged: bool = False,
 ) -> dict[str, Any]:
     try:
-        if preserve_if_unchanged:
+        stored: dict[str, Any] | None = None
+        if preserve_if_unchanged or record.get('lineups_confirmed') is False:
             response = (
                 supabase.table('predictions')
                 .select(','.join((*_PREDICTION_SEMANTIC_FIELDS, 'updated_at')))
@@ -151,8 +152,18 @@ def _persist_prediction(
                 .execute()
             )
             rows = response.data or []
-            if rows and _same_prediction(rows[0], record):
-                return dict(rows[0])
+            stored = dict(rows[0]) if rows else None
+        # Confirmation is monotonic for a fixture. A later statistical refresh
+        # or a transient empty provider response must never revert the final
+        # lineup state and accidentally unlock another AI recalibration.
+        if stored and stored.get('lineups_confirmed') is True:
+            record = {
+                **record,
+                'lineups_confirmed': True,
+                'stage': 'lineups_confirmed',
+            }
+        if preserve_if_unchanged and stored and _same_prediction(stored, record):
+            return stored
         supabase.table('predictions').upsert(record, on_conflict='fixture_id').execute()
         supabase.table('prediction_versions').insert({
             'fixture_id': record['fixture_id'],

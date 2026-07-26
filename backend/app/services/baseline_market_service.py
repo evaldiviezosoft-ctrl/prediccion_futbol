@@ -20,6 +20,8 @@ _STAT_METRICS = {
     'corners': ('home_corners', 'away_corners'),
     'total_shots': ('home_shots', 'away_shots'),
     'shots_on_goal': ('home_shots_on_target', 'away_shots_on_target'),
+    'yellow_cards': ('home_yellow_cards', 'away_yellow_cards'),
+    'goalkeeper_saves': ('home_goalkeeper_saves', 'away_goalkeeper_saves'),
 }
 
 
@@ -200,9 +202,10 @@ def estimate_team_statistics(
     """Estimate team counts with venue-specific Empirical-Bayes means.
 
     If the selected domestic/competition source has no detailed statistics,
-    Liga 1 Peru is used only as an explicitly labelled cross-league reference.
-    A missing reference sample results in omitted values rather than fabricated
-    numbers.
+    Liga 1 Peru is used only as an explicitly labelled cross-league reference
+    for volume metrics. Yellow cards require qualified coverage in the
+    selected competition itself. Missing evidence is omitted rather than
+    fabricated.
     """
 
     if prior_strength <= 0 or not math.isfinite(prior_strength):
@@ -259,6 +262,7 @@ def estimate_team_statistics(
             )
             coverage_gate_applies = (
                 selected_league_id != REFERENCE_STATISTICS_LEAGUE_ID
+                or metric in {'yellow_cards', 'goalkeeper_saves'}
             )
             selected_prior_qualified = (
                 bool(selected_values)
@@ -319,6 +323,13 @@ def estimate_team_statistics(
                     'configured_reference_league_all_venues'
                     if prior_values
                     else 'configured_reference_league_unavailable'
+                )
+            elif metric in {'yellow_cards', 'goalkeeper_saves'}:
+                # Discipline and keeper workload are competition-specific.
+                # Never manufacture them from a cross-league reference.
+                prior_selection_reason = (
+                    'selected_league_coverage_insufficient_no_cross_league_'
+                    + ('cards' if metric == 'yellow_cards' else 'saves')
                 )
             else:
                 prior_values, _reference_team_ids = candidates(

@@ -4,6 +4,7 @@ import 'package:prediccion_futbol/models/ai_calibration.dart';
 import 'package:prediccion_futbol/models/backend_health.dart';
 import 'package:prediccion_futbol/models/fixture_summary.dart';
 import 'package:prediccion_futbol/models/prediction.dart';
+import 'package:prediccion_futbol/models/probable_forecast.dart';
 import 'package:prediccion_futbol/repositories/football_data_source.dart';
 import 'package:prediccion_futbol/screens/prediction_screen.dart';
 
@@ -64,6 +65,7 @@ FixtureSummary _fixture(
 
 Prediction _baselinePrediction({
   Map<String, dynamic>? crossLeagueCalibration,
+  Map<String, dynamic> extraExpected = const {},
 }) => Prediction.fromJson({
   'fixture_id': 1,
   'home_team_name': 'Local',
@@ -81,6 +83,7 @@ Prediction _baselinePrediction({
     'away_shots': 10.0,
     'home_shots_on_target': 5.5,
     'away_shots_on_target': 3.0,
+    ...extraExpected,
   },
   'goal_lines': [
     {'line': 0.5, 'probability': 0.89},
@@ -91,6 +94,36 @@ Prediction _baselinePrediction({
   ],
   'possible_scorers': <Map<String, dynamic>>[],
   'possible_assistants': <Map<String, dynamic>>[],
+  'probable_forecast': [
+    {
+      'category': 'goals',
+      'title': 'Goles totales',
+      'prediction': 'Más de 1.5',
+      'probability': .67,
+      'confidence': 'medium',
+    },
+    {
+      'category': 'corners',
+      'title': 'Córners',
+      'prediction': 'Más de 7.5',
+      'probability': .72,
+      'confidence': 'medium',
+    },
+    {
+      'category': 'shots',
+      'title': 'Remates totales',
+      'prediction': '19–31',
+      'probability': null,
+      'confidence': 'medium',
+    },
+    {
+      'category': 'shots_on_target',
+      'title': 'Remates al arco',
+      'prediction': '6–11',
+      'probability': null,
+      'confidence': 'medium',
+    },
+  ],
   'updated_at': DateTime.now().toUtc().toIso8601String(),
   'model_metadata': {
     'model_type': 'statistical_baseline',
@@ -153,6 +186,7 @@ Prediction _fallbackPrediction({bool singleTeamProfile = true}) =>
 AiCalibrationResult _aiResult(
   AiCalibrationStatus status, {
   bool noBet = false,
+  bool compact = false,
 }) {
   if (status != AiCalibrationStatus.updated) {
     return AiCalibrationResult(
@@ -221,6 +255,82 @@ AiCalibrationResult _aiResult(
       dataQuality: 'medium',
       lineupsConsidered: false,
       modelLabel: 'Calibración contextual IA',
+      probableForecast: const [
+        ProbableForecastPick(
+          category: 'goals',
+          title: 'Goles totales',
+          prediction: 'Más de 1.5',
+          probability: .71,
+          confidence: 'medium',
+        ),
+        ProbableForecastPick(
+          category: 'corners',
+          title: 'Córners',
+          prediction: 'Más de 7.5',
+          probability: .69,
+          confidence: 'medium',
+        ),
+        ProbableForecastPick(
+          category: 'half_goals',
+          title: 'Gol por tiempo',
+          prediction: 'Más de 0.5 · 2.º tiempo',
+          probability: .73,
+          confidence: 'low',
+        ),
+        ProbableForecastPick(
+          category: 'cards',
+          title: 'Tarjetas amarillas',
+          prediction: 'Más de 0.5 · Local',
+          probability: .86,
+          confidence: 'high',
+        ),
+        ProbableForecastPick(
+          category: 'shots',
+          title: 'Remates totales',
+          prediction: '19–31',
+          confidence: 'medium',
+        ),
+        ProbableForecastPick(
+          category: 'saves',
+          title: 'Atajadas totales',
+          prediction: '4–9',
+          confidence: 'medium',
+        ),
+        ProbableForecastPick(
+          category: 'shots_on_target',
+          title: 'Remates al arco',
+          prediction: '6–11',
+          confidence: 'medium',
+        ),
+      ],
+      notes: compact
+          ? const [
+              AiCalibrationNote(
+                kind: 'adjustment',
+                text: 'El contexto reduce la ventaja inicial del local.',
+              ),
+              AiCalibrationNote(
+                kind: 'market',
+                text: 'El mercado de goles tiene el mayor respaldo.',
+              ),
+              AiCalibrationNote(
+                kind: 'risk',
+                text: 'Las alineaciones siguen pendientes.',
+              ),
+              AiCalibrationNote(
+                kind: 'missing_data',
+                text: 'No hay cuotas recientes.',
+              ),
+              AiCalibrationNote(
+                kind: 'model_error',
+                text: 'La muestra reciente es limitada.',
+              ),
+              AiCalibrationNote(
+                kind: 'risk',
+                text: 'Esta sexta nota no debe mostrarse.',
+              ),
+            ]
+          : null,
     ),
   );
 }
@@ -264,7 +374,7 @@ void main() {
       );
       expect(find.text('Predicción 1X2 (probabilidad)'), findsNothing);
 
-      await tester.scrollUntilVisible(find.text('Goles totales'), 300);
+      await tester.scrollUntilVisible(find.text('Más de 4.5 goles'), 300);
       expect(find.text('Más de 4.5 goles'), findsOneWidget);
 
       await tester.scrollUntilVisible(
@@ -275,24 +385,17 @@ void main() {
       expect(find.text('4.4'), findsNothing);
       expect(find.text('—'), findsWidgets);
 
-      await tester.scrollUntilVisible(find.text('Goleadores probables'), 300);
-      expect(
-        find.text(
-          'Aún no hay plantel o historial individual reciente suficiente.',
-        ),
-        findsAtLeastNWidgets(1),
-      );
-      await tester.scrollUntilVisible(find.text('Asistidores probables'), 300);
-      expect(
-        find.text(
-          'Aún no hay plantel o historial individual reciente suficiente.',
-        ),
-        findsWidgets,
-      );
-
       await tester.scrollUntilVisible(
         find.textContaining('no garantiza resultados'),
         300,
+      );
+      expect(find.text('Goleadores probables'), findsNothing);
+      expect(find.text('Asistidores probables'), findsNothing);
+      expect(
+        find.text(
+          'Aún no hay plantel o historial individual reciente suficiente.',
+        ),
+        findsNothing,
       );
       expect(
         find.text('Predicción orientativa • baja confianza'),
@@ -422,7 +525,7 @@ void main() {
   });
 
   testWidgets(
-    'baseline muestra líneas y explica cuando faltan datos individuales',
+    'baseline muestra líneas y oculta por completo datos individuales vacíos',
     (tester) async {
       final repository = _CountingRepository(_baselinePrediction());
 
@@ -433,27 +536,19 @@ void main() {
       );
       await tester.pumpAndSettle();
 
-      await tester.scrollUntilVisible(find.text('Goles totales'), 300);
+      await tester.scrollUntilVisible(find.text('Más de 4.5 goles'), 300);
       expect(find.text('Más de 4.5 goles'), findsOneWidget);
-
-      await tester.scrollUntilVisible(find.text('Goleadores probables'), 300);
-      expect(find.text('Córners'), findsOneWidget);
-      expect(find.text('Remates'), findsOneWidget);
-      expect(find.text('Goles'), findsNothing);
-      expect(find.textContaining('Liga 1 de Perú'), findsOneWidget);
-
-      await tester.scrollUntilVisible(find.text('Asistidores probables'), 300);
-      expect(
-        find.text(
-          'Aún no hay plantel o historial individual reciente suficiente.',
-        ),
-        findsAtLeastNWidgets(1),
-      );
 
       await tester.scrollUntilVisible(
         find.textContaining('Todas las estimaciones'),
         300,
       );
+      expect(find.text('Córners'), findsAtLeastNWidgets(1));
+      expect(find.text('Remates'), findsOneWidget);
+      expect(find.text('Goles'), findsNothing);
+      expect(find.textContaining('Liga 1 de Perú'), findsOneWidget);
+      expect(find.text('Goleadores probables'), findsNothing);
+      expect(find.text('Asistidores probables'), findsNothing);
       expect(find.textContaining('no garantizan resultados'), findsOneWidget);
       expect(
         find.text('Calibración orientativa por competición'),
@@ -462,6 +557,67 @@ void main() {
       expect(find.text('Marcadores probables'), findsNothing);
     },
   );
+
+  testWidgets(
+    'muestra tarjetas amarillas solo con el par y aclara su referencia',
+    (tester) async {
+      final repository = _CountingRepository(
+        _baselinePrediction(
+          extraExpected: const {
+            'home_yellow_cards': 2.4,
+            'away_yellow_cards': 3.1,
+          },
+        ),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PredictionScreen(fixture: _fixture(71), repository: repository),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(find.text('Tarjetas amarillas'), 300);
+
+      expect(find.text('Tarjetas amarillas'), findsOneWidget);
+      expect(find.text('2.4'), findsOneWidget);
+      expect(find.text('3.1'), findsOneWidget);
+      expect(
+        find.text(
+          'Referencia histórica; se actualizará con los partidos recientes '
+          'de la liga.',
+        ),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets('no muestra tarjetas amarillas cuando falta un valor del par', (
+    tester,
+  ) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(
+          fixture: _fixture(71),
+          repository: _CountingRepository(
+            _baselinePrediction(
+              extraExpected: const {'home_yellow_cards': 2.4},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.scrollUntilVisible(
+      find.textContaining('Todas las estimaciones'),
+      300,
+    );
+
+    expect(find.text('Tarjetas amarillas'), findsNothing);
+    expect(
+      find.textContaining('Referencia histórica; se actualizará'),
+      findsNothing,
+    );
+  });
 
   testWidgets('pending no oculta la predicción estadística base', (
     tester,
@@ -481,17 +637,16 @@ void main() {
 
     expect(find.text('Predicción 1X2 (probabilidad)'), findsOneWidget);
     await tester.scrollUntilVisible(
-      find.text('Calibración IA en preparación'),
+      find.byKey(const ValueKey('probable-forecast-card')),
       300,
     );
-    expect(
-      find.byKey(const ValueKey('ai-calibration-pending')),
-      findsOneWidget,
-    );
+    expect(find.text('Pronóstico probable'), findsOneWidget);
+    expect(find.text('Más de 1.5'), findsOneWidget);
+    expect(find.textContaining('Se mantiene fijo'), findsOneWidget);
     expect(find.text('39%'), findsAtLeastNWidgets(1));
   });
 
-  testWidgets('muestra calibración, deltas, evidencia y mercado respaldado', (
+  testWidgets('muestra únicamente el pronóstico probable estructurado', (
     tester,
   ) async {
     final repository = _CountingRepository(
@@ -507,29 +662,92 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.scrollUntilVisible(
-      find.text('Modelo base vs. calibración'),
+      find.byKey(const ValueKey('probable-forecast-card')),
       300,
     );
     expect(
       find.byKey(const ValueKey('ai-calibration-updated')),
       findsOneWidget,
     );
-    expect(find.text('-3 pp'), findsOneWidget);
-    expect(find.text('Factores y evidencia'), findsOneWidget);
+    expect(find.text('Más de 1.5'), findsOneWidget);
+    expect(find.text('Más de 7.5'), findsOneWidget);
+    expect(find.text('19–31'), findsOneWidget);
+    expect(find.text('4–9'), findsOneWidget);
+    expect(find.text('Modelo base vs. calibración'), findsNothing);
+    expect(find.text('Factores y evidencia'), findsNothing);
+    expect(find.text('Riesgos'), findsNothing);
+    expect(find.text('Datos faltantes'), findsNothing);
+    expect(find.text('Posibles límites del modelo'), findsNothing);
+  });
 
-    await tester.scrollUntilVisible(
-      find.text('Mercado con mayor respaldo'),
-      300,
+  testWidgets('mantiene la suscripción IA al bajar y volver a subir', (
+    tester,
+  ) async {
+    final repository = _CountingRepository(
+      _baselinePrediction(),
+      _aiResult(AiCalibrationStatus.updated),
     );
-    expect(find.text('Más de 1.5 goles'), findsOneWidget);
-    expect(find.text('Cuota teórica de referencia: 1.48'), findsOneWidget);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PredictionScreen(fixture: _fixture(71), repository: repository),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    final list = find.byType(ListView);
+    for (var index = 0; index < 12; index++) {
+      await tester.drag(list, const Offset(0, -500));
+      await tester.pump();
+    }
+    for (var index = 0; index < 12; index++) {
+      await tester.drag(list, const Offset(0, 500));
+      await tester.pump();
+    }
+    await tester.pumpAndSettle();
+
+    expect(tester.takeException(), isNull);
     expect(
-      find.textContaining('aún no se ha comprobado una ventaja de mercado'),
+      find.byKey(const ValueKey('ai-calibration-updated')),
       findsOneWidget,
     );
-    expect(find.textContaining('apuesta segura'), findsNothing);
-    expect(find.textContaining('no garantiza resultados'), findsOneWidget);
+    expect(repository.aiWatchCalls, 1);
   });
+
+  testWidgets(
+    'notas compactas reemplazan bloques narrativos legados y se limitan',
+    (tester) async {
+      final repository = _CountingRepository(
+        _baselinePrediction(),
+        _aiResult(AiCalibrationStatus.updated, compact: true),
+      );
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: PredictionScreen(fixture: _fixture(71), repository: repository),
+        ),
+      );
+      await tester.pumpAndSettle();
+      await tester.scrollUntilVisible(
+        find.byKey(const ValueKey('probable-forecast-card')),
+        300,
+      );
+
+      expect(find.text('Factores y evidencia'), findsNothing);
+      expect(find.text('Comparación de preparación'), findsNothing);
+      expect(find.text('Efecto de rotaciones'), findsNothing);
+      expect(find.text('Proyecciones estadísticas'), findsNothing);
+      final notes = tester.widget<Text>(
+        find.byKey(const ValueKey('probable-forecast-explanation')),
+      );
+      expect(notes.maxLines, 5);
+      expect(notes.overflow, TextOverflow.ellipsis);
+      expect(notes.data, contains('El contexto reduce'));
+      expect(notes.data, contains('La muestra reciente'));
+      expect(notes.data, isNot(contains('sexta nota')));
+      expect(find.text('Es el mercado con mayor respaldo.'), findsNothing);
+    },
+  );
 
   testWidgets('IA no compara 1X2 cuando solo existe un perfil histórico', (
     tester,
@@ -550,14 +768,11 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.scrollUntilVisible(
-      find.textContaining('No comparamos 1X2'),
+      find.byKey(const ValueKey('probable-forecast-card')),
       300,
     );
     expect(find.text('Modelo base vs. calibración'), findsNothing);
-    expect(
-      find.textContaining('falta un perfil histórico suficiente'),
-      findsOneWidget,
-    );
+    expect(find.textContaining('No comparamos 1X2'), findsNothing);
   });
 
   testWidgets(
@@ -577,14 +792,11 @@ void main() {
 
       expect(find.text('Predicción 1X2 (probabilidad)'), findsOneWidget);
       await tester.scrollUntilVisible(
-        find.text('No pudimos completar la calibración'),
+        find.byKey(const ValueKey('probable-forecast-card')),
         300,
       );
-      expect(
-        find.byKey(const ValueKey('ai-calibration-error')),
-        findsOneWidget,
-      );
-      expect(find.text('Comprobar estado'), findsOneWidget);
+      expect(find.text('Más de 1.5'), findsOneWidget);
+      expect(find.text('No pudimos completar la calibración'), findsNothing);
     },
   );
 
@@ -604,10 +816,11 @@ void main() {
     await tester.pumpAndSettle();
 
     await tester.scrollUntilVisible(
-      find.text('No hay una selección recomendable'),
+      find.byKey(const ValueKey('probable-forecast-card')),
       300,
     );
-    expect(find.text('No hay una selección recomendable'), findsOneWidget);
+    expect(find.text('Más de 1.5'), findsOneWidget);
+    expect(find.text('No hay una selección recomendable'), findsNothing);
     expect(find.textContaining('apuesta segura'), findsNothing);
   });
 }

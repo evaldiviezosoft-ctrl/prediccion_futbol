@@ -32,6 +32,15 @@ void main() {
       'possible_assistants': [
         {'player': 'Arrascaeta', 'team': 'Flamengo', 'probability': 0.29},
       ],
+      'probable_forecast': [
+        {
+          'category': 'goals',
+          'title': 'Goles totales',
+          'prediction': 'Más de 1.5',
+          'probability': .73,
+          'confidence': 'medium',
+        },
+      ],
       'updated_at': '2026-07-22T15:00:00Z',
       'model_metadata': {
         'model_type': 'statistical_baseline',
@@ -68,6 +77,8 @@ void main() {
     expect(prediction.goalLines[2].probability, 0.49);
     expect(prediction.possibleScorers.single.player, 'Pedro');
     expect(prediction.possibleAssistants.single.player, 'Arrascaeta');
+    expect(prediction.probableForecast.single.category, 'goals');
+    expect(prediction.probableForecast.single.prediction, 'Más de 1.5');
     expect(prediction.usesCrossLeagueStatisticsReference, isTrue);
     expect(prediction.statisticsReferenceRows, 41);
     expect(prediction.statisticsReferenceLeagueId, 281);

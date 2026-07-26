@@ -75,11 +75,11 @@ class Settings(BaseSettings):
     openai_model: str = 'gpt-5.6-sol'
     openai_reasoning_effort: Literal[
         'none', 'low', 'medium', 'high', 'xhigh', 'max'
-    ] = 'max'
+    ] = 'high'
     openai_request_timeout_seconds: float = Field(default=180.0, gt=0, le=600)
-    openai_max_output_tokens: int = Field(default=12_000, ge=2_000, le=32_000)
+    openai_max_output_tokens: int = Field(default=6_000, ge=2_000, le=32_000)
     ai_calibration_horizon_days: int = Field(default=14, ge=1, le=30)
-    ai_calibration_max_per_cycle: int = Field(default=10, ge=1, le=25)
+    ai_calibration_max_per_cycle: int = Field(default=5, ge=1, le=25)
     ai_calibration_min_edge_bps: int = Field(default=200, ge=0, le=2_000)
 
     enable_scheduler: bool = False

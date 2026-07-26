@@ -78,10 +78,10 @@ def test_team_markets_use_explicit_peru_reference_and_never_future_stats():
     ]
     selected, eligible = sources(rows)
     statistics = [
-        {'fixture_id': 4, 'team_id': 30, 'is_home': True, 'corners': 6, 'total_shots': 14, 'shots_on_goal': 5},
-        {'fixture_id': 4, 'team_id': 31, 'is_home': False, 'corners': 3, 'total_shots': 10, 'shots_on_goal': 3},
-        {'fixture_id': 5, 'team_id': 32, 'is_home': True, 'corners': 8, 'total_shots': 16, 'shots_on_goal': 7},
-        {'fixture_id': 5, 'team_id': 33, 'is_home': False, 'corners': 5, 'total_shots': 12, 'shots_on_goal': 4},
+        {'fixture_id': 4, 'team_id': 30, 'is_home': True, 'corners': 6, 'total_shots': 14, 'shots_on_goal': 5, 'yellow_cards': 2},
+        {'fixture_id': 4, 'team_id': 31, 'is_home': False, 'corners': 3, 'total_shots': 10, 'shots_on_goal': 3, 'yellow_cards': 3},
+        {'fixture_id': 5, 'team_id': 32, 'is_home': True, 'corners': 8, 'total_shots': 16, 'shots_on_goal': 7, 'yellow_cards': 4},
+        {'fixture_id': 5, 'team_id': 33, 'is_home': False, 'corners': 5, 'total_shots': 12, 'shots_on_goal': 4, 'yellow_cards': 5},
         # This tempting outlier belongs to an ineligible future fixture.
         {'fixture_id': 999, 'team_id': 30, 'is_home': True, 'corners': 99, 'total_shots': 99, 'shots_on_goal': 99},
     ]
@@ -125,6 +125,73 @@ def test_team_markets_use_explicit_peru_reference_and_never_future_stats():
         'minimum_valid_values_per_metric_and_venue': 40,
         'minimum_distinct_teams': 8,
     }
+    assert metadata['teams']['home']['metrics']['yellow_cards'] == {
+        'status': 'unavailable',
+        'team_rows': 0,
+        'prior_rows': 0,
+        'prior_selection_reason':
+            'selected_league_coverage_insufficient_no_cross_league_cards',
+        'coverage_gate': {
+            'applies': True,
+            'required_values': 40,
+            'required_distinct_teams': 8,
+            'observed_values': {'home': 0, 'away': 0},
+            'observed_distinct_teams': {'home': 0, 'away': 0},
+            'qualified': False,
+        },
+    }
+
+
+def test_cards_and_saves_require_qualified_selected_league_coverage():
+    rows = [
+        fixture(
+            index + 1,
+            league_id=71,
+            days_before=100 + index,
+            home=10 if index == 0 else 1000 + index,
+            away=20 if index == 1 else 2000 + index,
+        )
+        for index in range(NON_REFERENCE_PRIOR_MIN_VALUES_PER_VENUE)
+    ]
+    selected, eligible = sources(rows, league_id=71)
+    statistics = []
+    for index, row in enumerate(rows):
+        statistics.extend([
+            {
+                'fixture_id': row['id'],
+                'team_id': 110 if index == 0 else 3000 + index,
+                'is_home': True,
+                'yellow_cards': 2,
+                'goalkeeper_saves': 4,
+            },
+            {
+                'fixture_id': row['id'],
+                'team_id': 120 if index == 1 else 4000 + index,
+                'is_home': False,
+                'yellow_cards': 3,
+                'goalkeeper_saves': 5,
+            },
+        ])
+
+    expected, metadata = estimate_team_statistics(
+        sources=selected,
+        eligible_fixture_rows=eligible,
+        team_statistics_rows=statistics,
+    )
+
+    assert expected['home_yellow_cards'] == 2.0
+    assert expected['away_yellow_cards'] == 3.0
+    assert expected['home_goalkeeper_saves'] == 4.0
+    assert expected['away_goalkeeper_saves'] == 5.0
+    assert metadata['teams']['home']['metrics']['yellow_cards'][
+        'prior_league_id'
+    ] == 71
+    assert metadata['teams']['home']['metrics']['yellow_cards'][
+        'cross_league_reference'
+    ] is False
+    assert metadata['teams']['home']['metrics']['goalkeeper_saves'][
+        'cross_league_reference'
+    ] is False
 
 
 @pytest.mark.parametrize(
@@ -302,9 +369,9 @@ def test_team_observations_are_shrunk_toward_selected_league_prior():
     ]
     selected, eligible = sources(rows, league_id=281)
     statistics = [
-        {'fixture_id': 1, 'team_id': 110, 'is_home': True, 'corners': 10, 'total_shots': 20, 'shots_on_goal': 8},
-        {'fixture_id': 2, 'team_id': 120, 'is_home': False, 'corners': 2, 'total_shots': 8, 'shots_on_goal': 2},
-        {'fixture_id': 3, 'team_id': 112, 'is_home': True, 'corners': 4, 'total_shots': 10, 'shots_on_goal': 4},
+        {'fixture_id': 1, 'team_id': 110, 'is_home': True, 'corners': 10, 'total_shots': 20, 'shots_on_goal': 8, 'yellow_cards': 2},
+        {'fixture_id': 2, 'team_id': 120, 'is_home': False, 'corners': 2, 'total_shots': 8, 'shots_on_goal': 2, 'yellow_cards': 3},
+        {'fixture_id': 3, 'team_id': 112, 'is_home': True, 'corners': 4, 'total_shots': 10, 'shots_on_goal': 4, 'yellow_cards': 4},
     ]
 
     expected, metadata = estimate_team_statistics(
@@ -316,6 +383,14 @@ def test_team_observations_are_shrunk_toward_selected_league_prior():
 
     # Home prior is (10 + 4) / 2 = 7; posterior with one team observation is 8.5.
     assert expected['home_corners'] == 8.5
+    assert 'home_yellow_cards' not in expected
+    assert 'away_yellow_cards' not in expected
+    assert metadata['teams']['home']['metrics']['yellow_cards'][
+        'prior_selection_reason'
+    ] == 'selected_league_coverage_insufficient_no_cross_league_cards'
+    assert metadata['teams']['home']['metrics']['yellow_cards'][
+        'coverage_gate'
+    ]['qualified'] is False
     assert metadata['teams']['home']['metrics']['corners']['status'] == 'estimated'
     assert metadata['teams']['home']['metrics']['corners']['team_rows'] == 1
 

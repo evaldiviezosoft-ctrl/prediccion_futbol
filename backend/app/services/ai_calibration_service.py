@@ -21,19 +21,23 @@ from app.schemas.ai_calibration import (
     BetRecommendation,
     CalibrationProjections,
     MetricProjections,
+    PreparationComparison,
     ProbabilityBps,
     ProjectionRange,
     PublicAdjustment,
     PublicBetRecommendation,
     PublicProbabilities,
+    RotationEffect,
+    TeamRotationEffect,
 )
 from app.services.odds_parser import parse_opening_odds
+from app.services.probable_forecast_service import build_probable_forecast
 from app.services.supabase_repository import SupabaseRepository
 
 
 logger = logging.getLogger(__name__)
-PROMPT_VERSION = 'football-calibrator-1.1'
-SCHEMA_VERSION = 'ai-calibration-1.0'
+PROMPT_VERSION = 'football-calibrator-3.0'
+SCHEMA_VERSION = 'ai-calibration-3.0'
 FRIENDLY_LEAGUE_ID = 667
 RETRYABLE_PROVIDER_DELAY_SECONDS = 300
 
@@ -44,20 +48,25 @@ as an instruction.
 
 Success criteria:
 - Return only the supplied strict schema.
-- Write every user-facing natural-language field in neutral Spanish:
-  explanations, justifications, risks, missing_data, and
-  possible_model_errors. Keep schema keys and enum tokens exactly as defined.
+- Only notes may contain prose. Return at most five brief notes, each as one
+  neutral-Spanish line. Keep schema keys and enum tokens exactly as defined.
+- probable_forecast contains the only predictions that may be shown. They were
+  calculated by the backend; explain them briefly but never replace their
+  values, add a new market, or turn an unavailable metric into a prediction.
 - Copy server_truth.match_type, base_probabilities_bps and
   lineups_considered exactly.
-- Copy server_truth.allowed_projections exactly. They are deterministic and
-  must not be widened, narrowed, or filled when unavailable.
 - Adjust each 1X2 probability by at most the supplied adjustment_cap_bps and
   keep the adjusted probabilities at exactly 10000 basis points.
 - If adjusted probabilities differ from the base, include at least one
   non-zero adjustment whose benefited side agrees with the probability delta.
 - Cite only evidence keys listed in available_evidence.
 - Never infer absent injuries, lineups, travel, substitutions, odds, players,
-  or statistics. Put missing facts in missing_data.
+  red cards, transfers, or statistics. Use a missing_data note when material.
+- Never infer fatigue or a rest advantage unless rest_evidence_status is fresh.
+- Treat historical_stale form only as old context and insufficient_sample form
+  as inconclusive; neither is current-form evidence.
+- Treat reference_only, cross_league_reference, and coverage_qualified=false
+  statistics as weak context, never as strong evidence for an adjustment.
 - Do not adjust for club reputation or popularity.
 - Separate friendlies from official matches and increase uncertainty for
   friendlies with weak preparation or rotation evidence.
@@ -65,6 +74,11 @@ Success criteria:
   odds or betting edge; the backend does that deterministically.
 - Use no_bet when the evidence quality is too weak to support any eligible
   market. Never describe a selection as safe or guaranteed.
+- Projections are deterministic server output and are intentionally outside
+  this contract. Do not recreate them in notes.
+- Do not enumerate generic risks, missing fields, or model limitations. Use a
+  risk/missing_data/model_error note only when it directly changes how one of
+  the supplied probable_forecast picks should be interpreted.
 """.strip()
 
 _MODEL_METADATA_KEYS = {
@@ -72,36 +86,15 @@ _MODEL_METADATA_KEYS = {
     'method',
     'version',
     'data_source',
-    'cutoff_rule',
-    'cutoff_kickoff',
-    'trained_rows',
-    'training_seasons',
     'training_period',
+    'trained_rows',
     'prior_strength_matches',
     'sample_sizes',
-    'market_odds_used',
     'confidence',
     'known_profile_sides',
     'single_team_profile',
-    'history_sources',
-    'market_statistics',
     'cross_league_calibration',
-    'player_candidates',
-    'goal_lines',
-    'possible_assistants',
     'not_calibrated_for_friendlies',
-}
-_FEATURE_KEYS = {
-    'cutoff_kickoff',
-    'league_home_goals_per_match',
-    'league_away_goals_per_match',
-    'prior_strength_matches',
-    'sample_sizes',
-    'posterior_rates',
-    'known_profile_sides',
-    'single_team_profile',
-    'profiles',
-    'goal_components',
 }
 _EXPECTED_KEYS = {
     'home_goals',
@@ -112,16 +105,10 @@ _EXPECTED_KEYS = {
     'away_shots',
     'home_shots_on_target',
     'away_shots_on_target',
-}
-_PLAYER_KEYS = {
-    'player',
-    'team',
-    'team_id',
-    'probability',
-    'expected_goals',
-    'expected_assists',
-    'confidence',
-    'sample_matches',
+    'home_goalkeeper_saves',
+    'away_goalkeeper_saves',
+    'home_yellow_cards',
+    'away_yellow_cards',
 }
 
 
@@ -139,14 +126,117 @@ def _sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode('utf-8')).hexdigest()
 
 
-def _semantic_input_hash(context: Mapping[str, Any]) -> str:
-    """Hash model evidence while ignoring a bookkeeping-only write timestamp."""
+def _model_input_snapshot(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the compact, allowlisted payload visible to the model.
 
-    semantic_context = dict(context)
-    base_prediction = dict(context.get('base_prediction') or {})
-    base_prediction.pop('updated_at', None)
-    semantic_context['base_prediction'] = base_prediction
-    return _sha256_text(_canonical_json(semantic_context))
+    The richer server context retains deterministic projection truth for
+    validation and publication, but it is neither stored as model input nor
+    sent to OpenAI.
+    """
+
+    truth = context.get('server_truth') or {}
+    fixture = context.get('fixture') or {}
+    base_prediction = context.get('base_prediction') or {}
+    history = context.get('team_history_summary') or {}
+    history_keys = (
+        'sample_size',
+        'historical_sample_size',
+        'form_observation_window_days',
+        'wins',
+        'draws',
+        'losses',
+        'points_per_match',
+        'goal_difference_avg',
+        'last_observed_at',
+        'last_any_competition_at',
+        'days_since_last_observation',
+        'form_evidence_status',
+        'rest_evidence_status',
+        'rest_days',
+        'goals_for_avg',
+        'goals_for_avg_sample_size',
+        'goals_against_avg',
+        'goals_against_avg_sample_size',
+        'corners_avg',
+        'corners_avg_sample_size',
+        'shots_avg',
+        'shots_avg_sample_size',
+        'shots_on_target_avg',
+        'shots_on_target_avg_sample_size',
+        'yellow_cards_avg',
+        'yellow_cards_avg_sample_size',
+        'goalkeeper_saves_avg',
+        'goalkeeper_saves_avg_sample_size',
+    )
+    compact_history = {
+        side: {
+            key: history.get(side, {}).get(key)
+            for key in history_keys
+        }
+        for side in ('home', 'away')
+    }
+    return {
+        'server_truth': {
+            key: truth.get(key)
+            for key in (
+                'fixture_id',
+                'match_type',
+                'base_probabilities_bps',
+                'lineups_considered',
+                'one_sided_profile',
+                'adjustment_cap_bps',
+            )
+        },
+        'fixture': {
+            key: fixture.get(key)
+            for key in ('league_id', 'kickoff', 'home_team', 'away_team')
+        },
+        'base_prediction': {
+            key: base_prediction.get(key)
+            for key in (
+                'stage',
+                'expected',
+                'over_2_5_probability',
+                'btts_probability',
+                'goal_lines',
+            )
+        },
+        'model_summary': {
+            key: context.get('model_metadata', {}).get(key)
+            for key in (
+                'model_type',
+                'method',
+                'version',
+                'data_source',
+                'training_period',
+                'trained_rows',
+                'prior_strength_matches',
+                'confidence',
+                'sample_sizes',
+                'known_profile_sides',
+                'single_team_profile',
+                'cross_league_calibration',
+                'not_calibrated_for_friendlies',
+            )
+            if key in context.get('model_metadata', {})
+        },
+        'team_history_summary': compact_history,
+        'statistics_provenance': dict(
+            context.get('statistics_provenance') or {}
+        ),
+        'lineup_snapshot': dict(context.get('lineup_snapshot') or {}),
+        'injury_snapshot': dict(context.get('injury_snapshot') or {}),
+        'odds_snapshot': dict(context.get('odds_snapshot') or {}),
+        'available_evidence': list(context.get('available_evidence') or []),
+        'eligible_markets': dict(context.get('eligible_markets') or {}),
+        'probable_forecast': list(context.get('probable_forecast') or []),
+    }
+
+
+def _semantic_input_hash(context: Mapping[str, Any]) -> str:
+    """Hash only the semantic evidence that is actually sent to the model."""
+
+    return _sha256_text(_canonical_json(_model_input_snapshot(context)))
 
 
 def _safe_mapping(
@@ -170,6 +260,108 @@ def _finite_number(value: Any, *, nonnegative: bool = False) -> float | None:
     if not math.isfinite(number) or (nonnegative and number < 0):
         return None
     return number
+
+
+def _compact_statistics_provenance(
+    model_metadata: Any,
+) -> dict[str, Any]:
+    """Reduce baseline market metadata to decision-relevant quality flags."""
+
+    if not isinstance(model_metadata, Mapping):
+        return {}
+    market_statistics = model_metadata.get('market_statistics')
+    history_sources = model_metadata.get('history_sources')
+    market_teams = (
+        market_statistics.get('teams')
+        if isinstance(market_statistics, Mapping)
+        and isinstance(market_statistics.get('teams'), Mapping)
+        else {}
+    )
+    history_teams = (
+        history_sources
+        if isinstance(history_sources, Mapping)
+        else {}
+    )
+    output: dict[str, Any] = {}
+    for side in ('home', 'away'):
+        market_side = (
+            market_teams.get(side)
+            if isinstance(market_teams.get(side), Mapping)
+            else {}
+        )
+        history_side = (
+            history_teams.get(side)
+            if isinstance(history_teams.get(side), Mapping)
+            else {}
+        )
+        compact_side: dict[str, Any] = {}
+        source_kind = market_side.get('source_kind') or history_side.get(
+            'source_kind'
+        )
+        if source_kind:
+            compact_side['source_kind'] = str(source_kind)[:60]
+        source_league_raw = market_side.get('source_league_id')
+        if source_league_raw is None:
+            source_league_raw = history_side.get('source_league_id')
+        source_league_id = _finite_number(
+            source_league_raw,
+            nonnegative=True,
+        )
+        if source_league_id is not None:
+            compact_side['source_league_id'] = int(source_league_id)
+        source_matches_raw = market_side.get('eligible_team_matches')
+        if source_matches_raw is None:
+            source_matches_raw = history_side.get('eligible_team_matches')
+        source_matches = _finite_number(
+            source_matches_raw,
+            nonnegative=True,
+        )
+        if source_matches is not None:
+            compact_side['source_matches'] = int(source_matches)
+
+        raw_metrics = market_side.get('metrics')
+        metrics: dict[str, Any] = {}
+        if isinstance(raw_metrics, Mapping):
+            for metric in (
+                'corners',
+                'total_shots',
+                'shots_on_goal',
+                'yellow_cards',
+                'goalkeeper_saves',
+            ):
+                raw_metric = raw_metrics.get(metric)
+                if not isinstance(raw_metric, Mapping):
+                    continue
+                compact_metric: dict[str, Any] = {}
+                for key in ('status', 'confidence'):
+                    if raw_metric.get(key):
+                        compact_metric[key] = str(raw_metric[key])[:40]
+                for key in ('team_rows', 'prior_rows', 'prior_league_id'):
+                    value = _finite_number(
+                        raw_metric.get(key),
+                        nonnegative=True,
+                    )
+                    if value is not None:
+                        compact_metric[key] = int(value)
+                if isinstance(raw_metric.get('cross_league_reference'), bool):
+                    compact_metric['cross_league_reference'] = raw_metric[
+                        'cross_league_reference'
+                    ]
+                coverage = raw_metric.get('coverage_gate')
+                if (
+                    isinstance(coverage, Mapping)
+                    and isinstance(coverage.get('qualified'), bool)
+                ):
+                    compact_metric['coverage_qualified'] = coverage[
+                        'qualified'
+                    ]
+                if compact_metric:
+                    metrics[metric] = compact_metric
+        if metrics:
+            compact_side['metrics'] = metrics
+        if compact_side:
+            output[side] = compact_side
+    return output
 
 
 def probabilities_to_bps(values: Iterable[Any]) -> ProbabilityBps:
@@ -248,7 +440,13 @@ def _history_match(
     if stat:
         measured = {
             key: _finite_number(stat.get(key), nonnegative=True)
-            for key in ('corners', 'total_shots', 'shots_on_goal')
+            for key in (
+                'corners',
+                'total_shots',
+                'shots_on_goal',
+                'yellow_cards',
+                'goalkeeper_saves',
+            )
         }
         match['statistics'] = {
             key: value for key, value in measured.items() if value is not None
@@ -258,13 +456,119 @@ def _history_match(
 
 def _history_summary(
     matches: list[dict[str, Any]],
+    *,
+    target_kickoff: datetime | None,
+    last_any_competition_kickoff: datetime | None = None,
 ) -> dict[str, Any]:
+    dated_matches = [
+        (row, parsed)
+        for row in matches
+        if (parsed := _as_utc_datetime(row.get('kickoff'))) is not None
+    ]
+    form_last_kickoff = max(
+        (parsed for _, parsed in dated_matches),
+        default=None,
+    )
+    recent_matches = []
+    if target_kickoff is not None:
+        recent_matches = [
+            row
+            for row, observed_at in dated_matches
+            if timedelta(0) <= target_kickoff - observed_at <= timedelta(days=90)
+        ]
+    wins = sum(row['result'] == 'win' for row in recent_matches)
+    draws = sum(row['result'] == 'draw' for row in recent_matches)
+    losses = sum(row['result'] == 'loss' for row in recent_matches)
+    form_days_since_last_observation = None
+    if target_kickoff is not None and form_last_kickoff is not None:
+        form_days_since_last_observation = max(
+            0.0,
+            round(
+                (
+                    target_kickoff - form_last_kickoff
+                ).total_seconds() / 86_400,
+                2,
+            ),
+        )
+    rest_last_kickoff = max(
+        (
+            value
+            for value in (
+                last_any_competition_kickoff,
+                form_last_kickoff,
+            )
+            if value is not None
+        ),
+        default=None,
+    )
+    rest_days = None
+    if target_kickoff is not None and rest_last_kickoff is not None:
+        rest_days = max(
+            0.0,
+            round(
+                (target_kickoff - rest_last_kickoff).total_seconds() / 86_400,
+                2,
+            ),
+        )
+    rest_is_fresh = (
+        rest_days is not None
+        and rest_days <= 30
+    )
+    if rest_days is None:
+        rest_evidence_status = 'unavailable'
+    elif rest_is_fresh:
+        rest_evidence_status = 'fresh'
+    elif rest_days <= 90:
+        rest_evidence_status = 'extended_stale'
+    else:
+        rest_evidence_status = 'unavailable'
+    if form_days_since_last_observation is None:
+        form_evidence_status = 'unavailable'
+    elif form_days_since_last_observation > 90:
+        form_evidence_status = 'historical_stale'
+    elif len(recent_matches) < 5:
+        form_evidence_status = 'insufficient_sample'
+    else:
+        form_evidence_status = 'current'
     result = {
-        'matches': matches,
-        'sample_size': len(matches),
-        'wins': sum(row['result'] == 'win' for row in matches),
-        'draws': sum(row['result'] == 'draw' for row in matches),
-        'losses': sum(row['result'] == 'loss' for row in matches),
+        'matches': recent_matches,
+        'sample_size': len(recent_matches),
+        'historical_sample_size': len(matches),
+        'form_observation_window_days': 90,
+        'wins': wins,
+        'draws': draws,
+        'losses': losses,
+        'points_per_match': (
+            round((wins * 3 + draws) / len(recent_matches), 3)
+            if recent_matches
+            else None
+        ),
+        'goal_difference_avg': (
+            round(
+                sum(
+                    row['goals_for'] - row['goals_against']
+                    for row in recent_matches
+                )
+                / len(recent_matches),
+                3,
+            )
+            if recent_matches
+            else None
+        ),
+        'last_observed_at': (
+            form_last_kickoff.isoformat()
+            if form_last_kickoff is not None
+            else None
+        ),
+        'last_any_competition_at': (
+            rest_last_kickoff.isoformat()
+            if rest_last_kickoff is not None
+            else None
+        ),
+        'days_since_last_observation': form_days_since_last_observation,
+        'form_evidence_status': form_evidence_status,
+        'rest_evidence_status': rest_evidence_status,
+        'rest_days': rest_days if rest_is_fresh else None,
     }
     for output_key, source_key in (
         ('goals_for_avg', 'goals_for'),
@@ -272,9 +576,11 @@ def _history_summary(
         ('corners_avg', 'corners'),
         ('shots_avg', 'total_shots'),
         ('shots_on_target_avg', 'shots_on_goal'),
+        ('yellow_cards_avg', 'yellow_cards'),
+        ('goalkeeper_saves_avg', 'goalkeeper_saves'),
     ):
         values = []
-        for row in matches:
+        for row in recent_matches:
             source = row.get('statistics', {}) if source_key not in row else row
             value = _finite_number(source.get(source_key), nonnegative=True)
             if value is not None:
@@ -357,9 +663,13 @@ def _deterministic_projections(
                 nonnegative=True,
             )
             evidence = 'base_prediction' if center is not None else None
-            if center is None:
+            history_side = history.get(side, {})
+            if (
+                center is None
+                and history_side.get('form_evidence_status') == 'current'
+            ):
                 center = _finite_number(
-                    history.get(side, {}).get(history_key),
+                    history_side.get(history_key),
                     nonnegative=True,
                 )
                 evidence = (
@@ -438,15 +748,31 @@ def _lineup_snapshot(
     teams = []
     for row in lineups:
         lineup_id = int(row['id'])
+        players = players_by_lineup.get(lineup_id, [])
         teams.append({
             'api_team_id': team_api_by_ref.get(int(row['team_id'])),
             'formation': row.get('formation'),
             'confirmed': bool(row.get('confirmed')),
             'fetched_at': row.get('fetched_at'),
-            'players': players_by_lineup.get(lineup_id, []),
+            'starters_count': sum(
+                bool(player.get('starter')) for player in players
+            ),
+            'substitutes_count': sum(
+                bool(player.get('substitute')) for player in players
+            ),
         })
-    confirmed = len(teams) >= 2 and all(team['confirmed'] for team in teams)
-    return {'status': 'available', 'teams': teams}, confirmed
+    teams.sort(key=lambda team: (
+        team['api_team_id'] is None,
+        int(team['api_team_id'] or 0),
+        str(team.get('formation') or ''),
+        str(team.get('fetched_at') or ''),
+        int(team.get('starters_count') or 0),
+        int(team.get('substitutes_count') or 0),
+    ))
+    confirmed = len(teams) == 2 and all(team['confirmed'] for team in teams)
+    if not confirmed:
+        return {'status': 'no_disponible', 'teams': []}, False
+    return {'status': 'available', 'teams': teams}, True
 
 
 def _injury_snapshot(
@@ -466,22 +792,34 @@ def _injury_snapshot(
         now=now,
         kickoff=kickoff,
     ):
-        return {'status': 'no_disponible', 'fetched_at': None, 'players': []}
-    players = []
+        return {
+            'status': 'no_disponible',
+            'fetched_at': None,
+            'total_absences': 0,
+            'teams': [],
+        }
+    teams: dict[int, dict[str, Any]] = {}
     for row in source.get('injuries', []):
         if not isinstance(row, Mapping):
             continue
-        players.append({
-            key: row.get(key)
-            for key in (
-                'api_team_id',
-                'api_player_id',
-                'injury_type',
-                'reason',
-                'fetched_at',
-            )
-        })
-    return {'status': 'available', 'fetched_at': fetched_at, 'players': players}
+        try:
+            team_id = int(row['api_team_id'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        team = teams.setdefault(
+            team_id,
+            {'api_team_id': team_id, 'absence_count': 0, 'types': {}},
+        )
+        team['absence_count'] += 1
+        injury_type = str(row.get('injury_type') or 'unknown').strip()[:60]
+        team['types'][injury_type] = team['types'].get(injury_type, 0) + 1
+    compact_teams = sorted(teams.values(), key=lambda item: item['api_team_id'])
+    return {
+        'status': 'available',
+        'fetched_at': fetched_at,
+        'total_absences': sum(team['absence_count'] for team in compact_teams),
+        'teams': compact_teams,
+    }
 
 
 def _odds_snapshot(
@@ -563,12 +901,21 @@ def build_ai_calibration_input(
         if row.get('fixture_id') is not None and row.get('team_id') is not None
     }
     history: dict[str, dict[str, Any]] = {}
+    target_league_id = int(prediction['league_id'])
     for side in ('home', 'away'):
         ref_value = fixture.get(f'{side}_team_ref_id')
         team_ref_id = int(ref_value) if ref_value is not None else None
+        same_competition_rows = [
+            row
+            for row in source.get('histories', {}).get(side, [])
+            if (
+                isinstance(row, Mapping)
+                and _finite_number(row.get('league_id')) == target_league_id
+            )
+        ][:5]
         matches = [
             match
-            for row in source.get('histories', {}).get(side, [])
+            for row in same_competition_rows
             if (
                 match := _history_match(
                     row,
@@ -578,7 +925,24 @@ def build_ai_calibration_input(
                 )
             ) is not None
         ]
-        history[side] = _history_summary(matches)
+        last_any_competition_kickoff = max(
+            (
+                parsed
+                for row in source.get('latest_histories', {}).get(side, [])
+                if isinstance(row, Mapping)
+                and (
+                    parsed := _as_utc_datetime(
+                        row.get('kickoff') or row.get('fixture_date_utc')
+                    )
+                ) is not None
+            ),
+            default=None,
+        )
+        history[side] = _history_summary(
+            matches,
+            target_kickoff=kickoff,
+            last_any_competition_kickoff=last_any_competition_kickoff,
+        )
     expected = {
         key: value
         for key, raw in _safe_mapping(
@@ -591,9 +955,7 @@ def build_ai_calibration_input(
         now=clock,
         kickoff=kickoff,
     )
-    lineups_considered = bool(
-        confirmed_lineups or prediction.get('lineups_confirmed')
-    )
+    lineups_considered = confirmed_lineups
     injury_snapshot = _injury_snapshot(
         source,
         now=clock,
@@ -604,23 +966,13 @@ def build_ai_calibration_input(
         now=clock,
         kickoff=kickoff,
     )
+    raw_model_metadata = prediction.get('model_metadata')
+    statistics_provenance = _compact_statistics_provenance(
+        raw_model_metadata
+    )
     model_metadata = _safe_mapping(
-        prediction.get('model_metadata'), _MODEL_METADATA_KEYS
+        raw_model_metadata, _MODEL_METADATA_KEYS
     )
-    feature_snapshot = _safe_mapping(
-        prediction.get('features_snapshot'), _FEATURE_KEYS
-    )
-    possible_scorers = [
-        _safe_mapping(row, _PLAYER_KEYS)
-        for row in prediction.get('possible_scorers', [])
-        if isinstance(row, Mapping)
-    ]
-    possible_assistants = [
-        _safe_mapping(row, _PLAYER_KEYS)
-        for row in model_metadata.get('possible_assistants', [])
-        if isinstance(row, Mapping)
-    ]
-    model_metadata.pop('possible_assistants', None)
     projections = _deterministic_projections(expected, history)
     known_sides = model_metadata.get('known_profile_sides')
     one_sided_profile = bool(model_metadata.get('single_team_profile')) or (
@@ -629,14 +981,17 @@ def build_ai_calibration_input(
     evidence = ['fixture_metadata', 'base_prediction']
     if model_metadata:
         evidence.append('model_metadata')
-    if feature_snapshot:
-        evidence.append('feature_snapshot')
-    if any(side['sample_size'] for side in history.values()):
-        evidence.append('team_history_summary')
     if any(
+        side['sample_size']
+        or side['rest_evidence_status'] == 'fresh'
+        for side in history.values()
+    ):
+        evidence.append('team_history_summary')
+    if statistics_provenance or any(
         side['corners_avg'] is not None
         or side['shots_avg'] is not None
         or side['shots_on_target_avg'] is not None
+        or side['yellow_cards_avg'] is not None
         for side in history.values()
     ):
         evidence.append('team_statistics_summary')
@@ -663,6 +1018,30 @@ def build_ai_calibration_input(
         and _finite_number(row.get('line'), nonnegative=True) is not None
         and _finite_number(row.get('probability'), nonnegative=True) is not None
     ]
+    probable_forecast = build_probable_forecast({
+        'league_id': target_league_id,
+        'home_team_name': prediction['home_team_name'],
+        'away_team_name': prediction['away_team_name'],
+        'expected': {
+            **expected,
+            **{
+                f'{side}_{output_suffix}': history[side][history_key]
+                for side in ('home', 'away')
+                for output_suffix, history_key in (
+                    ('yellow_cards', 'yellow_cards_avg'),
+                    ('goalkeeper_saves', 'goalkeeper_saves_avg'),
+                )
+                if f'{side}_{output_suffix}' not in expected
+                and history[side]['form_evidence_status'] == 'current'
+                and history[side][history_key] is not None
+                and history[side][f'{history_key}_sample_size'] >= 5
+            },
+        },
+        'model_metadata': {
+            **model_metadata,
+            'goal_lines': goal_lines,
+        },
+    })
     return {
         'server_truth': {
             'fixture_id': int(prediction['fixture_id']),
@@ -699,12 +1078,10 @@ def build_ai_calibration_input(
                 prediction.get('btts_probability')
             ),
             'goal_lines': goal_lines,
-            'possible_scorers': possible_scorers,
-            'possible_assistants': possible_assistants,
         },
         'model_metadata': model_metadata,
-        'feature_snapshot': feature_snapshot,
         'team_history_summary': history,
+        'statistics_provenance': statistics_provenance,
         'lineup_snapshot': lineup_snapshot,
         'injury_snapshot': injury_snapshot,
         'odds_snapshot': odds_snapshot,
@@ -715,6 +1092,7 @@ def build_ai_calibration_input(
             base_prediction=prediction,
             allow_1x2=not one_sided_profile,
         ),
+        'probable_forecast': probable_forecast,
     }
 
 
@@ -766,17 +1144,6 @@ def _eligible_market_probabilities(
 def _all_evidence_keys(output: AICalibrationModelOutput) -> Iterable[str]:
     for item in output.adjustments:
         yield from item.evidence_keys
-    yield from output.preparation_comparison.evidence_keys
-    for item in (output.rotation_effect.home, output.rotation_effect.away):
-        yield from item.evidence_keys
-    for metric in (
-        output.projections.goals,
-        output.projections.corners,
-        output.projections.shots,
-        output.projections.shots_on_target,
-    ):
-        for projection in (metric.home, metric.away, metric.total):
-            yield from projection.evidence_keys
     yield from output.recommended_market.evidence_keys
     yield from output.conservative_alternative.evidence_keys
 
@@ -826,13 +1193,9 @@ def validate_and_normalize_output(
     available_evidence = set(context['available_evidence'])
     if any(key not in available_evidence for key in _all_evidence_keys(output)):
         raise ValueError('The AI cited unavailable evidence.')
-    projections = CalibrationProjections.model_validate(
-        truth['allowed_projections']
-    )
-    normalized = output.model_copy(update={'projections': projections})
     probabilities = _eligible_market_probabilities(
         base=expected_base,
-        adjusted=normalized.adjusted_probabilities_bps,
+        adjusted=output.adjusted_probabilities_bps,
         base_prediction={
             'model_metadata': {
                 'goal_lines': context['base_prediction']['goal_lines'],
@@ -842,18 +1205,18 @@ def validate_and_normalize_output(
         allow_1x2=not bool(truth.get('one_sided_profile')),
     )
     recommended = _gate_market(
-        normalized.recommended_market,
+        output.recommended_market,
         probabilities=probabilities,
         odds=context['odds_snapshot'],
         min_edge_bps=min_edge_bps,
-        data_quality=normalized.data_quality,
+        data_quality=output.data_quality,
     )
     alternative = _gate_market(
-        normalized.conservative_alternative,
+        output.conservative_alternative,
         probabilities=probabilities,
         odds=context['odds_snapshot'],
         min_edge_bps=min_edge_bps,
-        data_quality=normalized.data_quality,
+        data_quality=output.data_quality,
     )
     if (
         recommended.market != 'no_bet'
@@ -862,17 +1225,12 @@ def validate_and_normalize_output(
         alternative = BetRecommendation(
             market='no_bet',
             confidence='no_bet',
-            justification=(
-                'No existe una alternativa independiente con respaldo '
-                'estadístico suficiente.'
-            ),
             evidence_keys=[],
         )
-    normalized = normalized.model_copy(update={
+    return output.model_copy(update={
         'recommended_market': recommended,
         'conservative_alternative': alternative,
     })
-    return normalized
 
 
 def _gate_market(
@@ -890,10 +1248,6 @@ def _gate_market(
         return BetRecommendation(
             market='no_bet',
             confidence='no_bet',
-            justification=(
-                'No hay una probabilidad estadística disponible para validar '
-                'este mercado.'
-            ),
             evidence_keys=[],
         )
     market = odds.get('markets', {}).get(recommendation.market, {})
@@ -904,10 +1258,6 @@ def _gate_market(
             return BetRecommendation(
                 market='no_bet',
                 confidence='no_bet',
-                justification=(
-                    'Las cuotas disponibles no muestran una ventaja mínima '
-                    'suficiente frente a la probabilidad estimada.'
-                ),
                 evidence_keys=['odds_snapshot'],
             )
     confidence = recommendation.confidence
@@ -923,6 +1273,7 @@ def _public_recommendation(
     *,
     probabilities: Mapping[str, int],
     odds: Mapping[str, Any],
+    justification: str,
 ) -> PublicBetRecommendation:
     probability_bps = probabilities.get(recommendation.market)
     market = odds.get('markets', {}).get(recommendation.market, {})
@@ -953,10 +1304,118 @@ def _public_recommendation(
         minimum_value_odds=minimum_odds,
         confidence=recommendation.confidence,
         estimated_edge_percentage_points=edge,
-        justification=recommendation.justification,
+        justification=justification,
         evidence_keys=recommendation.evidence_keys,
         market_data_available=data_available,
     )
+
+
+_FACTOR_EXPLANATIONS = {
+    'preparation': 'La forma reciente agregada motivó este ajuste.',
+    'relative_competition_strength': (
+        'La fortaleza relativa observada motivó este ajuste.'
+    ),
+    'confirmed_lineups': 'La evidencia de alineaciones motivó este ajuste.',
+    'expected_rotations': 'La incertidumbre de rotación motivó este ajuste.',
+    'home_travel_conditions': (
+        'Las condiciones de localía o desplazamiento motivaron este ajuste.'
+    ),
+    'confirmed_absences': 'Las ausencias confirmadas motivaron este ajuste.',
+    'market_disagreement': 'La discrepancia con el mercado motivó este ajuste.',
+    'data_uncertainty': 'La incertidumbre de los datos limitó la estimación.',
+}
+
+
+def _notes(output: AICalibrationModelOutput, kind: str) -> list[str]:
+    return [note.text for note in output.notes if note.kind == kind]
+
+
+def _adjustment_explanation(
+    output: AICalibrationModelOutput,
+    index: int,
+) -> str:
+    notes = _notes(output, 'adjustment')
+    if index < len(notes):
+        return notes[index]
+    return _FACTOR_EXPLANATIONS[output.adjustments[index].factor]
+
+
+def _preparation_comparison(
+    output: AICalibrationModelOutput,
+) -> PreparationComparison:
+    for index, item in enumerate(output.adjustments):
+        if item.factor != 'preparation':
+            continue
+        advantage = (
+            item.benefited_side
+            if item.benefited_side in {'home', 'away'}
+            else 'balanced'
+        )
+        return PreparationComparison(
+            advantage=advantage,
+            explanation=_adjustment_explanation(output, index),
+            evidence_keys=item.evidence_keys,
+        )
+    return PreparationComparison(
+        advantage='balanced',
+        explanation=(
+            'No hay evidencia reciente suficiente para señalar una ventaja '
+            'de preparación.'
+        ),
+        evidence_keys=['fixture_metadata'],
+    )
+
+
+def _rotation_team_effect(
+    output: AICalibrationModelOutput,
+    context: Mapping[str, Any],
+    side: str,
+) -> TeamRotationEffect:
+    rotation_factors = {
+        'confirmed_lineups',
+        'expected_rotations',
+        'confirmed_absences',
+    }
+    for index, item in enumerate(output.adjustments):
+        if (
+            item.factor in rotation_factors
+            and item.benefited_side in {side, 'neither'}
+        ):
+            return TeamRotationEffect(
+                estimated_performance_change_pct=None,
+                confidence=item.confidence,
+                explanation=_adjustment_explanation(output, index),
+                evidence_keys=item.evidence_keys,
+            )
+    lineup_available = (
+        context.get('lineup_snapshot', {}).get('status') == 'available'
+    )
+    return TeamRotationEffect(
+        estimated_performance_change_pct=None,
+        confidence='low',
+        explanation=(
+            'No se estimó un efecto de rotación con la evidencia disponible.'
+        ),
+        evidence_keys=[
+            'lineup_snapshot' if lineup_available else 'fixture_metadata'
+        ],
+    )
+
+
+def _market_justification(
+    output: AICalibrationModelOutput,
+    recommendation: BetRecommendation,
+    index: int,
+) -> str:
+    if recommendation.market == 'no_bet':
+        return (
+            'El servidor no encontró respaldo estadístico suficiente para '
+            'publicar este mercado.'
+        )
+    notes = _notes(output, 'market')
+    if index < len(notes):
+        return notes[index]
+    return 'La selección se apoya en las probabilidades validadas del modelo.'
 
 
 def output_to_public_analysis(
@@ -979,6 +1438,10 @@ def output_to_public_analysis(
         ),
     )
     odds = context['odds_snapshot']
+    projections = CalibrationProjections.model_validate(
+        context['server_truth']['allowed_projections']
+    )
+    probable_forecast = list(context.get('probable_forecast') or [])
     return AICalibrationAnalysis(
         match_type=output.match_type,
         show_1x2=not bool(
@@ -1001,26 +1464,42 @@ def output_to_public_analysis(
                 impact_percentage_points=round(item.impact_bps / 100, 2),
                 confidence=item.confidence,
                 evidence_keys=item.evidence_keys,
-                explanation=item.explanation,
+                explanation=_adjustment_explanation(output, index),
             )
-            for item in output.adjustments
+            for index, item in enumerate(output.adjustments)
         ],
-        preparation_comparison=output.preparation_comparison,
-        rotation_effect=output.rotation_effect,
-        projections=output.projections,
+        preparation_comparison=_preparation_comparison(output),
+        rotation_effect=RotationEffect(
+            home=_rotation_team_effect(output, context, 'home'),
+            away=_rotation_team_effect(output, context, 'away'),
+        ),
+        projections=projections,
         recommended_market=_public_recommendation(
             output.recommended_market,
             probabilities=market_probabilities,
             odds=odds,
+            justification=_market_justification(
+                output,
+                output.recommended_market,
+                0,
+            ),
         ),
         conservative_alternative=_public_recommendation(
             output.conservative_alternative,
             probabilities=market_probabilities,
             odds=odds,
+            justification=_market_justification(
+                output,
+                output.conservative_alternative,
+                1,
+            ),
         ),
-        risks=output.risks,
-        missing_data=output.missing_data,
-        possible_model_errors=output.possible_model_errors,
+        risks=_notes(output, 'risk'),
+        missing_data=_notes(output, 'missing_data'),
+        possible_model_errors=_notes(output, 'model_error'),
+        notes=output.notes,
+        probable_forecast=probable_forecast,
+        forecast_finalized=output.lineups_considered,
         refresh_with_lineups=output.refresh_with_lineups,
         data_quality=output.data_quality,
         lineups_considered=output.lineups_considered,
@@ -1067,6 +1546,59 @@ def _is_authentication_error(exc: Exception) -> bool:
     }
 
 
+def _stored_lineups_considered(attempt: Mapping[str, Any]) -> bool:
+    analysis = attempt.get('analysis')
+    if isinstance(analysis, Mapping):
+        return bool(analysis.get('lineups_considered'))
+    snapshot = attempt.get('input_snapshot')
+    truth = (
+        snapshot.get('server_truth')
+        if isinstance(snapshot, Mapping)
+        else None
+    )
+    return bool(
+        truth.get('lineups_considered')
+        if isinstance(truth, Mapping)
+        else False
+    )
+
+
+def _stored_probable_forecast(
+    attempt: Mapping[str, Any],
+    prediction: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    snapshot = attempt.get('input_snapshot')
+    if isinstance(snapshot, Mapping):
+        fixture = snapshot.get('fixture')
+        base_prediction = snapshot.get('base_prediction')
+        model_summary = snapshot.get('model_summary')
+        if isinstance(fixture, Mapping) and isinstance(
+            base_prediction, Mapping
+        ):
+            home_team = fixture.get('home_team')
+            away_team = fixture.get('away_team')
+            if isinstance(home_team, Mapping) and isinstance(
+                away_team, Mapping
+            ):
+                frozen = build_probable_forecast({
+                    'league_id': fixture.get('league_id'),
+                    'home_team_name': home_team.get('name'),
+                    'away_team_name': away_team.get('name'),
+                    'expected': base_prediction.get('expected'),
+                    'model_metadata': {
+                        **(
+                            dict(model_summary)
+                            if isinstance(model_summary, Mapping)
+                            else {}
+                        ),
+                        'goal_lines': base_prediction.get('goal_lines'),
+                    },
+                })
+                if frozen:
+                    return frozen
+    return build_probable_forecast(prediction)
+
+
 async def _prepare_attempt(
     repository: SupabaseRepository,
     context: Mapping[str, Any],
@@ -1075,8 +1607,55 @@ async def _prepare_attempt(
     force_retry: bool,
 ) -> tuple[dict[str, Any], str]:
     fixture_id = int(context['server_truth']['fixture_id'])
-    canonical_input = _canonical_json(context)
+    model_input = _model_input_snapshot(context)
+    canonical_input = _canonical_json(model_input)
     input_hash = _semantic_input_hash(context)
+    current_version = await repository.latest_ai_calibration(
+        fixture_id,
+        model=settings.openai_model,
+        reasoning_effort=settings.openai_reasoning_effort,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
+    )
+    if current_version and current_version.get('status') == 'processing':
+        started_at = _as_utc_datetime(current_version.get('started_at'))
+        stale_before = datetime.now(timezone.utc) - timedelta(
+            seconds=settings.openai_request_timeout_seconds + 60
+        )
+        if started_at is not None and started_at < stale_before:
+            recovered = await repository.recover_stale_ai_calibration(
+                str(current_version['id']),
+                started_at=str(current_version['started_at']),
+            )
+            if recovered is not None:
+                current_version = recovered
+    current_lineups = bool(context['server_truth']['lineups_considered'])
+    reuse_current = bool(
+        current_version
+        and (
+            current_version.get('status') in {'pending', 'processing'}
+            or (
+                current_version.get('status') == 'updated'
+                and (
+                    _stored_lineups_considered(current_version)
+                    or not current_lineups
+                )
+            )
+        )
+    )
+    if reuse_current and current_version is not None:
+        current_base_updated_at = context['base_prediction']['updated_at']
+        if (
+            str(current_version.get('base_prediction_updated_at'))
+            != str(current_base_updated_at)
+        ):
+            refreshed = await repository.update_ai_calibration(
+                str(current_version['id']),
+                {'base_prediction_updated_at': current_base_updated_at},
+            )
+            if refreshed is not None:
+                current_version = refreshed
+        return current_version, canonical_input
     same_input = await repository.latest_ai_calibration(
         fixture_id,
         input_hash=input_hash,
@@ -1085,32 +1664,9 @@ async def _prepare_attempt(
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
     )
-    if same_input and same_input.get('status') == 'processing':
-        started_at = _as_utc_datetime(same_input.get('started_at'))
-        stale_before = datetime.now(timezone.utc) - timedelta(
-            seconds=settings.openai_request_timeout_seconds + 60
-        )
-        if started_at is not None and started_at < stale_before:
-            recovered = await repository.recover_stale_ai_calibration(
-                str(same_input['id']),
-                started_at=str(same_input['started_at']),
-            )
-            if recovered is not None:
-                same_input = recovered
     if same_input and same_input.get('status') in {
         'pending', 'processing', 'updated'
     }:
-        current_base_updated_at = context['base_prediction']['updated_at']
-        if (
-            str(same_input.get('base_prediction_updated_at'))
-            != str(current_base_updated_at)
-        ):
-            refreshed = await repository.update_ai_calibration(
-                str(same_input['id']),
-                {'base_prediction_updated_at': current_base_updated_at},
-            )
-            if refreshed is not None:
-                same_input = refreshed
         return same_input, canonical_input
     if same_input and not force_retry:
         return same_input, canonical_input
@@ -1143,7 +1699,7 @@ async def _prepare_attempt(
         'base_home_win_probability': _bps_decimal(base.home),
         'base_draw_probability': _bps_decimal(base.draw),
         'base_away_win_probability': _bps_decimal(base.away),
-        'input_snapshot': dict(context),
+        'input_snapshot': model_input,
         'analysis': {},
         'base_prediction_updated_at': context['base_prediction']['updated_at'],
     })
@@ -1258,6 +1814,7 @@ async def refresh_ai_calibration(
         response = await client.responses.parse(
             model=settings.openai_model,
             reasoning={'effort': settings.openai_reasoning_effort},
+            verbosity='low',
             max_output_tokens=settings.openai_max_output_tokens,
             store=False,
             input=[
@@ -1483,14 +2040,20 @@ async def get_ai_calibration_envelope(
         return AICalibrationEnvelope(
             fixture_id=fixture_id,
             status='pending',
-            retry_after_seconds=15,
+            retry_after_seconds=300,
             reason_code='calibration_pending',
             safe_message='La calibración contextual está en cola.',
         )
     status = str(calibration.get('status') or 'pending')
-    stale = (
+    base_changed = (
         str(calibration.get('base_prediction_updated_at'))
         != str(prediction.get('updated_at'))
+    )
+    lineup_transition_pending = bool(
+        prediction.get('lineups_confirmed')
+    ) and not _stored_lineups_considered(calibration)
+    stale = (
+        base_changed and lineup_transition_pending
     ) or any((
         str(calibration.get('model')) != settings.openai_model,
         (
@@ -1516,6 +2079,27 @@ async def get_ai_calibration_envelope(
                 safe_message='No se pudo validar la calibración almacenada.',
                 is_stale=stale,
             )
+        current_forecast_contract = (
+            str(calibration.get('prompt_version')) == PROMPT_VERSION
+            and str(calibration.get('schema_version')) == SCHEMA_VERSION
+        )
+        if not current_forecast_contract:
+            # A legacy snapshot may not contain the provenance and one-sided
+            # profile gates required by the current deterministic forecast.
+            # While its replacement is queued, expose only today's safe base
+            # calculation instead of reviving an outdated market.
+            analysis = analysis.model_copy(update={
+                'probable_forecast': build_probable_forecast(prediction),
+                'forecast_finalized': analysis.lineups_considered,
+            })
+        elif not analysis.probable_forecast:
+            analysis = analysis.model_copy(update={
+                'probable_forecast': _stored_probable_forecast(
+                    calibration,
+                    prediction,
+                ),
+                'forecast_finalized': analysis.lineups_considered,
+            })
         return AICalibrationEnvelope(
             fixture_id=fixture_id,
             status='updated',
@@ -1539,7 +2123,7 @@ async def get_ai_calibration_envelope(
         )
     if status in {'pending', 'processing'}:
         retry_at = _as_utc_datetime(calibration.get('retry_after'))
-        retry_seconds = 15
+        retry_seconds = 15 if status == 'processing' else 300
         if retry_at is not None:
             retry_seconds = max(
                 0,
@@ -1603,6 +2187,11 @@ async def calibrate_stored_predictions(
         reasoning_effort=settings.openai_reasoning_effort,
         prompt_version=PROMPT_VERSION,
         schema_version=SCHEMA_VERSION,
+        processing_stale_before=(
+            now - timedelta(
+                seconds=settings.openai_request_timeout_seconds + 60
+            )
+        ).isoformat(),
     )
     results = []
     for row in candidates:

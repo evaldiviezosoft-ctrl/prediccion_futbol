@@ -53,6 +53,23 @@ def should_apply_fixture_update(existing_status: Any, incoming_status: Any) -> b
     return not (existing in FINAL_FIXTURE_STATUSES and incoming not in FINAL_FIXTURE_STATUSES)
 
 
+def _calibration_used_lineups(row: Mapping[str, Any]) -> bool:
+    analysis = row.get('analysis')
+    if isinstance(analysis, Mapping):
+        return bool(analysis.get('lineups_considered'))
+    snapshot = row.get('input_snapshot')
+    truth = (
+        snapshot.get('server_truth')
+        if isinstance(snapshot, Mapping)
+        else None
+    )
+    return bool(
+        truth.get('lineups_considered')
+        if isinstance(truth, Mapping)
+        else False
+    )
+
+
 def _apply_cup_aggregate_scores(rows: Sequence[dict[str, Any]]) -> None:
     """Fill aggregate scores when both finished legs are present in one season batch."""
 
@@ -316,6 +333,7 @@ class SupabaseRepository:
         kickoff: str,
         statuses: Iterable[str] = PLAYED_FIXTURE_STATUSES,
         limit: int = 100,
+        league_id: int | None = None,
     ) -> list[dict[str, Any]]:
         """Read a club's stored history across configured and targeted leagues."""
 
@@ -338,14 +356,19 @@ class SupabaseRepository:
         # The Supabase client is synchronous underneath and reuses one httpx
         # connection pool. Concurrent ``to_thread`` reads against that shared
         # client can fail intermittently on Windows with WSAEWOULDBLOCK.
+        home_equals = {'home_team_id': int(api_team_id)}
+        away_equals = {'away_team_id': int(api_team_id)}
+        if league_id is not None:
+            home_equals['league_id'] = int(league_id)
+            away_equals['league_id'] = int(league_id)
         home_rows = await self._select(
             'fixtures',
-            equals={'home_team_id': int(api_team_id)},
+            equals=home_equals,
             **common,
         )
         away_rows = await self._select(
             'fixtures',
-            equals={'away_team_id': int(api_team_id)},
+            equals=away_equals,
             **common,
         )
         merged = {
@@ -379,7 +402,10 @@ class SupabaseRepository:
         for index in range(0, len(ids), POSTGREST_IN_FILTER_CHUNK_SIZE):
             rows.extend(await self._select(
                 'fixture_team_statistics',
-                columns='fixture_id,team_id,is_home,corners,total_shots,shots_on_goal',
+                columns=(
+                    'fixture_id,team_id,is_home,corners,total_shots,'
+                    'shots_on_goal,yellow_cards,goalkeeper_saves'
+                ),
                 in_values={'fixture_id': ids[index:index + POSTGREST_IN_FILTER_CHUNK_SIZE]},
                 order_by=('fixture_id', False),
             ))
@@ -515,11 +541,20 @@ class SupabaseRepository:
             return None
         kickoff = str(prediction['kickoff'])
         histories: dict[str, list[dict[str, Any]]] = {}
+        latest_histories: dict[str, list[dict[str, Any]]] = {}
         for side in ('home', 'away'):
             histories[side] = await self.historical_finished_fixtures_for_team(
                 api_team_id=int(prediction[f'{side}_team_id']),
                 kickoff=kickoff,
                 limit=history_limit,
+                league_id=int(prediction['league_id']),
+            )
+            latest_histories[side] = (
+                await self.historical_finished_fixtures_for_team(
+                    api_team_id=int(prediction[f'{side}_team_id']),
+                    kickoff=kickoff,
+                    limit=1,
+                )
             )
         fixture_ids = {
             int(row['id'])
@@ -586,6 +621,7 @@ class SupabaseRepository:
             'prediction': prediction,
             'fixture': fixture,
             'histories': histories,
+            'latest_histories': latest_histories,
             'statistics': statistics,
             'lineups': lineups,
             'lineup_players': lineup_players,
@@ -752,10 +788,11 @@ class SupabaseRepository:
         reasoning_effort: str,
         prompt_version: str,
         schema_version: str,
+        processing_stale_before: str,
     ) -> list[dict[str, Any]]:
         predictions = await self._select(
             'predictions',
-            columns='fixture_id,kickoff,updated_at',
+            columns='fixture_id,kickoff,updated_at,lineups_confirmed',
             equals={'published': True},
             gte_values={'kickoff': starts_at},
             lte_values={'kickoff': ends_at},
@@ -772,9 +809,9 @@ class SupabaseRepository:
             attempts.extend(await self._select(
                 'prediction_calibrations',
                 columns=(
-                    'fixture_id,attempt_number,status,retry_after,'
+                    'fixture_id,attempt_number,status,retry_after,started_at,'
                     'base_prediction_updated_at,model,reasoning_effort,'
-                    'prompt_version,schema_version'
+                    'prompt_version,schema_version,analysis'
                 ),
                 in_values={
                     'fixture_id': fixture_ids[
@@ -793,17 +830,30 @@ class SupabaseRepository:
                 latest[fixture_id] = row
         now = datetime.now(timezone.utc)
 
-        def retry_due(row: Mapping[str, Any]) -> bool:
-            value = row.get('retry_after')
+        def parse_utc(value: Any) -> datetime | None:
             if not value:
-                return True
+                return None
             try:
                 parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
             except (TypeError, ValueError):
-                return True
+                return None
             if parsed.tzinfo is None:
                 parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.astimezone(timezone.utc) <= now
+            return parsed.astimezone(timezone.utc)
+
+        stale_before = parse_utc(processing_stale_before)
+        if stale_before is None:
+            raise ValueError('processing_stale_before must be an ISO timestamp')
+
+        def retry_due(row: Mapping[str, Any]) -> bool:
+            retry_after = parse_utc(row.get('retry_after'))
+            return retry_after is None or retry_after <= now
+
+        def processing_lease_expired(row: Mapping[str, Any]) -> bool:
+            if row.get('status') != 'processing':
+                return False
+            started_at = parse_utc(row.get('started_at'))
+            return started_at is not None and started_at < stale_before
 
         never_calibrated = []
         refresh_candidates = []
@@ -821,12 +871,20 @@ class SupabaseRepository:
             )):
                 refresh_candidates.append(prediction)
                 continue
-            if str(attempt.get('base_prediction_updated_at')) != str(
-                prediction.get('updated_at')
-            ):
+            if attempt.get('status') == 'pending' and retry_due(attempt):
                 refresh_candidates.append(prediction)
                 continue
-            if attempt.get('status') == 'pending' and retry_due(attempt):
+            if processing_lease_expired(attempt):
+                refresh_candidates.append(prediction)
+                continue
+            if (
+                attempt.get('status') == 'updated'
+                and bool(prediction.get('lineups_confirmed'))
+                and not _calibration_used_lineups(attempt)
+                and str(attempt.get('base_prediction_updated_at')) != str(
+                    prediction.get('updated_at')
+                )
+            ):
                 refresh_candidates.append(prediction)
         return [
             *never_calibrated,
@@ -2038,6 +2096,23 @@ class SupabaseRepository:
             player_ids=player_ids,
             fetched_at=fetched_at,
         )
+        if confirmed:
+            # Mark the published prediction before recording the optional-sync
+            # confirmation. If this database write fails, the provider poll can
+            # retry instead of leaving the final calibration frozen forever.
+            await self._update(
+                'predictions',
+                {
+                    'lineups_confirmed': True,
+                    'stage': 'lineups_confirmed',
+                    'updated_at': fetched_at,
+                },
+                equals={
+                    'fixture_id': normalized.api_fixture_id,
+                    'published': True,
+                },
+                select='fixture_id',
+            )
         await self.update_optional_sync_status(
             normalized.api_fixture_id,
             {

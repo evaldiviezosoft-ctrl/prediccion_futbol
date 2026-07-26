@@ -184,11 +184,13 @@ class PublishedPredictionQuery(MissingPredictionQuery):
             'away_team_id': 127,
             'home_team_name': 'Chapecoense-SC',
             'away_team_name': 'Flamengo',
+            'league_id': 71,
+            'expected': {'home_goals': 1.2, 'away_goals': 1.4},
             'likely_scores': [{'score': '1-2', 'probability': 0.12}],
             'model_metadata': {
                 'model_type': 'statistical_baseline',
                 'method': 'poisson_empirical_bayes',
-                'goal_lines': [{'line': 0.5, 'probability': 0.9}],
+                'goal_lines': [{'line': 1.5, 'probability': 0.73}],
                 'possible_assistants': [
                     {'player': 'Jugador A', 'team': 'Flamengo', 'probability': 0.2}
                 ],
@@ -429,13 +431,23 @@ def test_published_prediction_contract_returns_model_metadata(monkeypatch):
     assert response.json()['model_metadata'] == {
         'model_type': 'statistical_baseline',
         'method': 'poisson_empirical_bayes',
-        'goal_lines': [{'line': 0.5, 'probability': 0.9}],
+        'goal_lines': [{'line': 1.5, 'probability': 0.73}],
         'possible_assistants': [
             {'player': 'Jugador A', 'team': 'Flamengo', 'probability': 0.2}
         ],
     }
-    assert response.json()['goal_lines'] == [{'line': 0.5, 'probability': 0.9}]
+    assert response.json()['goal_lines'] == [{'line': 1.5, 'probability': 0.73}]
     assert response.json()['possible_assistants'][0]['player'] == 'Jugador A'
+    assert [
+        item['category'] for item in response.json()['probable_forecast']
+    ] == ['goals', 'half_goals']
+    assert response.json()['probable_forecast'][0] == {
+        'category': 'goals',
+        'title': 'Goles totales',
+        'prediction': 'Más de 1.5',
+        'probability': 0.73,
+        'confidence': 'medium',
+    }
     assert response.json()['home_team_country'] == 'Brazil'
     assert response.json()['away_team_country'] == 'Brazil'
     assert 'likely_scores' not in response.json()

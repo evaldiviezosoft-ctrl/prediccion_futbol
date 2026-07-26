@@ -82,6 +82,8 @@ class DemoFootballRepository implements FootballDataSource {
         'away_shots': 9.7,
         'home_shots_on_target': 6.1,
         'away_shots_on_target': 3.2,
+        'home_yellow_cards': 2.3,
+        'away_yellow_cards': 2.8,
       },
       goalLines: const [
         GoalLineProbability(line: 0.5, probability: 0.91),
@@ -120,6 +122,78 @@ class DemoFootballRepository implements FootballDataSource {
         'match_type': 'official',
         'base_probabilities': {'home': .58, 'draw': .24, 'away': .18},
         'adjusted_probabilities': {'home': .55, 'draw': .25, 'away': .20},
+        'probable_forecast': [
+          {
+            'category': 'goals',
+            'title': 'Goles totales',
+            'prediction': 'Más de 1.5',
+            'probability': .76,
+            'confidence': 'medium',
+          },
+          {
+            'category': 'corners',
+            'title': 'Córners',
+            'prediction': 'Más de 7.5',
+            'probability': .71,
+            'confidence': 'medium',
+          },
+          {
+            'category': 'half_goals',
+            'title': 'Gol por tiempo',
+            'prediction': 'Más de 0.5 · 2.º tiempo',
+            'probability': .73,
+            'confidence': 'low',
+          },
+          {
+            'category': 'cards',
+            'title': 'Tarjetas amarillas',
+            'prediction': 'Más de 0.5 · Valencia',
+            'probability': .88,
+            'confidence': 'high',
+          },
+          {
+            'category': 'shots',
+            'title': 'Remates totales',
+            'prediction': '19–30',
+            'probability': null,
+            'confidence': 'medium',
+          },
+          {
+            'category': 'saves',
+            'title': 'Atajadas totales',
+            'prediction': '4–9',
+            'probability': null,
+            'confidence': 'medium',
+          },
+          {
+            'category': 'shots_on_target',
+            'title': 'Remates al arco',
+            'prediction': '7–12',
+            'probability': null,
+            'confidence': 'medium',
+          },
+        ],
+        'forecast_finalized': false,
+        'notes': [
+          {
+            'kind': 'adjustment',
+            'text':
+                'La forma reciente reduce ligeramente la ventaja inicial del local.',
+          },
+          {
+            'kind': 'market',
+            'text':
+                'Ambos equipos marcan conserva el mejor respaldo disponible.',
+          },
+          {
+            'kind': 'risk',
+            'text': 'Las alineaciones todavía no están confirmadas.',
+          },
+          {
+            'kind': 'missing_data',
+            'text': 'No hay cuotas recientes para medir valor de mercado.',
+          },
+        ],
         'adjustments': [
           {
             'factor': 'Forma y nivel de oposición',

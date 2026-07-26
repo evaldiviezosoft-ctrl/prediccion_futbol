@@ -172,6 +172,7 @@ def test_lineups_wait_for_ninety_minute_window_retry_and_stop_when_confirmed():
         service.sync_fixture(fixture, options=options, now=NOW + timedelta(minutes=15))
     )
     assert confirmed.lineups_downloaded == 1
+    assert confirmed.confirmed_fixture_ids == [9001]
     assert repository.status['lineups_confirmed_at'] is not None
     assert repository.status['lineups_next_retry_at'] is None
 
@@ -185,6 +186,7 @@ def test_lineups_wait_for_ninety_minute_window_retry_and_stop_when_confirmed():
 class RecordingRepository(SupabaseRepository):
     def __init__(self) -> None:
         self.upserts: list[dict[str, Any]] = []
+        self.updates: list[dict[str, Any]] = []
         self.status_changes: list[dict[str, Any]] = []
 
     async def _upsert(
@@ -213,6 +215,14 @@ class RecordingRepository(SupabaseRepository):
 
     async def _select(self, *_args, **_kwargs):
         return []
+
+    async def _update(self, table, changes, *, equals, **_kwargs):
+        self.updates.append({
+            'table': table,
+            'changes': dict(changes),
+            'equals': dict(equals),
+        })
+        return [{'fixture_id': equals.get('fixture_id')}]
 
     async def update_optional_sync_status(self, fixture_id, changes):
         self.status_changes.append(dict(changes))
@@ -256,3 +266,44 @@ def test_duplicate_injury_items_are_collapsed_before_bulk_upsert():
     )
     assert len(injury_upsert['rows']) == 1
     assert injury_upsert['on_conflict'] == 'fixture_id,source_key'
+
+
+def test_confirmed_lineups_mark_prediction_before_optional_status():
+    repository = RecordingRepository()
+    item = fixture_payload(fixture_id=9001)
+    item['lineups'] = [
+        {
+            'team': {'id': 10, 'name': 'Home'},
+            'formation': '4-3-3',
+            'startXI': [{'player': {'id': 101, 'name': 'Home Player'}}],
+            'substitutes': [],
+        },
+        {
+            'team': {'id': 20, 'name': 'Away'},
+            'formation': '4-4-2',
+            'startXI': [{'player': {'id': 201, 'name': 'Away Player'}}],
+            'substitutes': [],
+        },
+    ]
+    normalized = normalize_fixture(item, competition_id=7)
+
+    asyncio.run(repository.persist_fixture_lineups(
+        normalized,
+        fetched_at=NOW.isoformat(),
+        next_retry_at=None,
+        confirmed=True,
+    ))
+
+    assert repository.updates == [{
+        'table': 'predictions',
+        'changes': {
+            'lineups_confirmed': True,
+            'stage': 'lineups_confirmed',
+            'updated_at': NOW.isoformat(),
+        },
+        'equals': {
+            'fixture_id': 9001,
+            'published': True,
+        },
+    }]
+    assert repository.status_changes[0]['lineups_confirmed_at'] == NOW.isoformat()

@@ -10,6 +10,7 @@ from app.services.ai_calibration_service import (
 )
 from app.services.calendar_visibility import local_team_country
 from app.services.prediction_service import refresh_prediction
+from app.services.probable_forecast_service import build_probable_forecast
 
 router = APIRouter(prefix='/predictions', tags=['predictions'])
 
@@ -41,6 +42,7 @@ def get_prediction(fixture_id: int):
     payload['possible_assistants'] = (
         possible_assistants if isinstance(possible_assistants, list) else []
     )
+    payload['probable_forecast'] = build_probable_forecast(payload)
     team_ids = [
         int(team_id)
         for team_id in (
@@ -80,16 +82,9 @@ def get_prediction(fixture_id: int):
 @router.get('/{fixture_id}/analysis', response_model=AICalibrationEnvelope)
 async def get_analysis(
     fixture_id: int,
-    background_tasks: BackgroundTasks,
 ) -> AICalibrationEnvelope:
     try:
-        current = await get_ai_calibration_envelope(fixture_id)
-        if (
-            get_settings().openai_configured
-            and (current.status == 'pending' or current.is_stale)
-        ):
-            background_tasks.add_task(refresh_ai_calibration, fixture_id)
-        return current
+        return await get_ai_calibration_envelope(fixture_id)
     except BackendError:
         raise
     except Exception as exc:

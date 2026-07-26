@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -94,6 +94,7 @@ class OptionalFixtureSyncResult:
     odds_snapshots_downloaded: int = 0
     external_predictions_downloaded: int = 0
     lineups_downloaded: int = 0
+    confirmed_fixture_ids: list[int] = field(default_factory=list)
 
     def merge(self, other: OptionalFixtureSyncResult) -> None:
         self.downloaded += other.downloaded
@@ -102,6 +103,7 @@ class OptionalFixtureSyncResult:
         self.odds_snapshots_downloaded += other.odds_snapshots_downloaded
         self.external_predictions_downloaded += other.external_predictions_downloaded
         self.lineups_downloaded += other.lineups_downloaded
+        self.confirmed_fixture_ids.extend(other.confirmed_fixture_ids)
 
 
 class OptionalFixtureSyncService:
@@ -229,6 +231,8 @@ class OptionalFixtureSyncService:
                 )
                 result.downloaded += 1
                 result.lineups_downloaded += 1
+                if confirmed:
+                    result.confirmed_fixture_ids.append(fixture_id)
 
         return result
 
