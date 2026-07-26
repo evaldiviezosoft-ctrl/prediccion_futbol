@@ -27,11 +27,21 @@ class SharedApi:
         self.closed = True
 
 
+class EmptyStoredRepository:
+    def __init__(self, *, client):
+        self.client = client
+
+    async def stored_upcoming_fixtures(self, **_kwargs):
+        return []
+
+    async def published_prediction_fixture_ids(self, _fixture_ids):
+        return set()
+
+
 def test_job_syncs_horizon_limits_predictions_and_reports_each_result(monkeypatch):
     now = datetime(2099, 8, 22, 12, tzinfo=timezone.utc)
     api = SharedApi()
     db = object()
-    sink = object()
     api_factory_arguments = {}
     calls = {'sync': 0, 'predictions': []}
     settings = Settings(
@@ -62,17 +72,14 @@ def test_job_syncs_horizon_limits_predictions_and_reports_each_result(monkeypatc
         return {'stage': 'prematch'}
 
     monkeypatch.setattr(job_service, 'get_settings', lambda: settings)
+
     def api_factory(**kwargs):
         api_factory_arguments.update(kwargs)
         return api
 
     assert job_service.ApiFootballClient is BudgetedApiFootballClient
     monkeypatch.setattr(job_service, 'get_supabase', lambda: db)
-    monkeypatch.setattr(
-        job_service,
-        'SupabaseRepository',
-        lambda *, client: sink if client is db else None,
-    )
+    monkeypatch.setattr(job_service, 'SupabaseRepository', EmptyStoredRepository)
     monkeypatch.setattr(job_service, 'ApiFootballClient', api_factory)
     monkeypatch.setattr(job_service, 'sync_fixtures_by_date', fake_sync)
     monkeypatch.setattr(job_service, 'refresh_prediction', fake_refresh)
@@ -86,7 +93,11 @@ def test_job_syncs_horizon_limits_predictions_and_reports_each_result(monkeypatc
     assert result['predictions_succeeded'] == 1
     assert result['predictions_failed'] == 1
     assert result['prediction_results'][1]['error']['code'] == 'prediction_input_error'
-    assert api_factory_arguments == {'request_log_sink': sink}
+    assert isinstance(
+        api_factory_arguments['request_log_sink'],
+        EmptyStoredRepository,
+    )
+    assert api_factory_arguments['request_log_sink'].client is db
     assert api.closed is True
 
 
@@ -117,6 +128,7 @@ def test_job_keeps_synced_days_and_predicts_when_date_window_stops_horizon(monke
 
     monkeypatch.setattr(job_service, 'get_settings', lambda: settings)
     monkeypatch.setattr(job_service, 'get_supabase', lambda: object())
+    monkeypatch.setattr(job_service, 'SupabaseRepository', EmptyStoredRepository)
     monkeypatch.setattr(job_service, 'ApiFootballClient', lambda **_kwargs: api)
     monkeypatch.setattr(job_service, 'sync_fixtures_by_date', fake_sync)
     monkeypatch.setattr(job_service, 'refresh_prediction', fake_refresh)
@@ -152,6 +164,7 @@ def test_job_does_not_hide_date_access_error_on_first_sync_day(monkeypatch):
 
     monkeypatch.setattr(job_service, 'get_settings', lambda: settings)
     monkeypatch.setattr(job_service, 'get_supabase', lambda: object())
+    monkeypatch.setattr(job_service, 'SupabaseRepository', EmptyStoredRepository)
     monkeypatch.setattr(job_service, 'ApiFootballClient', lambda **_kwargs: api)
     monkeypatch.setattr(job_service, 'sync_fixtures_by_date', fake_sync)
 
@@ -177,6 +190,9 @@ def test_db_only_baseline_job_never_constructs_provider_or_request_log(monkeypat
                 fixture_row(501, now + timedelta(hours=1), league_id=281),
                 fixture_row(502, now + timedelta(hours=2), league_id=71),
             ]
+
+        async def published_prediction_fixture_ids(self, _fixture_ids):
+            return set()
 
     async def fake_refresh(fixture_id, **kwargs):
         refresh_calls.append((fixture_id, kwargs))
@@ -253,6 +269,7 @@ def test_calendar_unknowns_do_not_displace_profile_backed_fixture(monkeypatch):
 
     monkeypatch.setattr(job_service, 'get_settings', lambda: settings)
     monkeypatch.setattr(job_service, 'get_supabase', lambda: object())
+    monkeypatch.setattr(job_service, 'SupabaseRepository', EmptyStoredRepository)
     monkeypatch.setattr(job_service, 'ApiFootballClient', lambda **_kwargs: api)
     monkeypatch.setattr(job_service, 'sync_fixtures_by_date', fake_sync)
     monkeypatch.setattr(job_service, 'refresh_prediction', fake_refresh)
@@ -303,6 +320,9 @@ def test_stored_calendar_candidates_are_filtered_before_prediction_limit(
             query_calls.append(kwargs)
             return [*unknowns, barcelona]
 
+        async def published_prediction_fixture_ids(self, _fixture_ids):
+            return set()
+
     async def fake_refresh(fixture_id, **_kwargs):
         refreshed.append(fixture_id)
         return {
@@ -331,7 +351,7 @@ def test_stored_calendar_candidates_are_filtered_before_prediction_limit(
         db_client=database,
     ))
 
-    assert query_calls[0]['limit'] == 1000
+    assert query_calls[0]['limit'] is None
     assert refreshed == [1999]
     assert result['predictions_succeeded'] == 1
 
@@ -354,6 +374,9 @@ def test_stored_calendar_candidate_enabled_by_history_is_attempted(monkeypatch):
 
         async def stored_upcoming_fixtures(self, **_kwargs):
             return [history_backed]
+
+        async def published_prediction_fixture_ids(self, _fixture_ids):
+            return set()
 
     async def fake_refresh(fixture_id, **_kwargs):
         refreshed.append(fixture_id)
@@ -384,3 +407,115 @@ def test_stored_calendar_candidate_enabled_by_history_is_attempted(monkeypatch):
     assert refreshed == [2001]
     assert result['fixtures_found'] == 1
     assert result['predictions_attempted'] == 1
+
+
+def test_db_only_job_prioritizes_unpublished_then_refreshes_published(monkeypatch):
+    now = datetime(2099, 8, 22, 12, tzinfo=timezone.utc)
+    database = object()
+    refreshed = []
+    published_queries = []
+    rows = [
+        fixture_row(3001, now + timedelta(hours=1), league_id=71),
+        fixture_row(3002, now + timedelta(hours=3), league_id=71),
+        fixture_row(3003, now + timedelta(hours=2), league_id=71),
+    ]
+
+    class PriorityRepository:
+        def __init__(self, *, client):
+            assert client is database
+
+        async def stored_upcoming_fixtures(self, **_kwargs):
+            return rows
+
+        async def published_prediction_fixture_ids(self, fixture_ids):
+            published_queries.append(set(fixture_ids))
+            return {3001, 3003}
+
+    async def fake_refresh(fixture_id, **_kwargs):
+        refreshed.append(fixture_id)
+        return {
+            'stage': 'prematch',
+            'model_metadata': {'model_type': 'statistical_baseline'},
+        }
+
+    monkeypatch.setattr(job_service, 'SupabaseRepository', PriorityRepository)
+    monkeypatch.setattr(job_service, 'refresh_prediction', fake_refresh)
+
+    result = asyncio.run(job_service.predict_stored_baselines(
+        horizon_days=2,
+        max_matches=2,
+        now=now,
+        db_client=database,
+    ))
+
+    assert published_queries == [{3001, 3002, 3003}]
+    assert refreshed == [3002, 3001]
+    assert result['predictions_succeeded'] == 2
+
+
+def test_sync_job_uses_stored_horizon_and_unpublished_take_priority(monkeypatch):
+    now = datetime(2099, 8, 22, 12, tzinfo=timezone.utc)
+    database = object()
+    api = SharedApi()
+    refreshed = []
+    stored_queries = []
+    settings = Settings(
+        _env_file=None,
+        scheduler_horizon_days=1,
+        max_matches_per_scheduler_cycle=2,
+        default_timezone='UTC',
+    )
+    freshly_synced = fixture_row(4001, now + timedelta(hours=1))
+    previously_stored_published = fixture_row(
+        4002,
+        now + timedelta(hours=2),
+    )
+    previously_stored_unpublished = fixture_row(
+        4003,
+        now + timedelta(hours=3),
+    )
+
+    class HorizonRepository:
+        def __init__(self, *, client):
+            assert client is database
+
+        async def stored_upcoming_fixtures(self, **kwargs):
+            stored_queries.append(kwargs)
+            return [
+                previously_stored_published,
+                previously_stored_unpublished,
+            ]
+
+        async def published_prediction_fixture_ids(self, fixture_ids):
+            assert set(fixture_ids) == {4001, 4002, 4003}
+            return {4001, 4002}
+
+    async def fake_sync(*_args, **_kwargs):
+        return FixtureSyncResult(rows=[freshly_synced], rate_limit=None)
+
+    async def fake_refresh(fixture_id, **_kwargs):
+        refreshed.append(fixture_id)
+        return {'stage': 'prematch'}
+
+    monkeypatch.setattr(job_service, 'get_settings', lambda: settings)
+    monkeypatch.setattr(job_service, 'get_supabase', lambda: database)
+    monkeypatch.setattr(job_service, 'SupabaseRepository', HorizonRepository)
+    monkeypatch.setattr(job_service, 'ApiFootballClient', lambda **_kwargs: api)
+    monkeypatch.setattr(job_service, 'sync_fixtures_by_date', fake_sync)
+    monkeypatch.setattr(job_service, 'refresh_prediction', fake_refresh)
+
+    result = asyncio.run(job_service.sync_and_predict(now=now))
+
+    assert refreshed == [4003, 4001]
+    assert stored_queries == [{
+        'league_ids': job_service.SYNC_LEAGUE_IDS,
+        'start_kickoff': now.isoformat(),
+        'end_kickoff': (now + timedelta(days=1)).isoformat(),
+        'statuses': job_service.BASELINE_UPCOMING_STATUSES,
+        'limit': None,
+    }]
+    assert result['fixtures_synced'] == 1
+    assert result['stored_fixtures_found'] == 2
+    assert result['eligible_fixtures'] == 3
+    assert result['predictions_attempted'] == 2
+    assert api.closed is True

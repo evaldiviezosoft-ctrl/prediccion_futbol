@@ -22,6 +22,7 @@ from app.services.baseline_model_service import (
 from app.services.calendar_visibility import filter_visible_calendar_fixtures
 from app.services.fixture_service import (
     CALENDAR_ONLY_LEAGUE_IDS,
+    SYNC_LEAGUE_IDS,
     sync_fixtures_by_date,
     validate_timezone,
 )
@@ -45,6 +46,22 @@ def _public_failure(exc: Exception) -> dict[str, str]:
     if isinstance(exc, BackendError):
         return {'code': exc.code, 'detail': exc.public_detail}
     return {'code': 'prediction_failed', 'detail': 'No se pudo generar esta predicción.'}
+
+
+def _prioritize_unpublished(
+    rows: list[dict[str, Any]],
+    published_fixture_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Keep chronological order within unpublished and published candidates."""
+
+    return sorted(
+        rows,
+        key=lambda row: (
+            int(row['id']) in published_fixture_ids,
+            _kickoff_utc(row),
+            int(row['id']),
+        ),
+    )
 
 
 async def predict_stored_baselines(
@@ -73,11 +90,20 @@ async def predict_stored_baselines(
             start_kickoff=start.isoformat(),
             end_kickoff=end.isoformat(),
             statuses=BASELINE_UPCOMING_STATUSES,
-            limit=1000,
+            limit=None,
         )
-        fixtures = filter_visible_calendar_fixtures(
+        visible_fixtures = filter_visible_calendar_fixtures(
             database,
             candidates,
+        )
+        published_fixture_ids = (
+            await repository.published_prediction_fixture_ids(
+                int(row['id']) for row in visible_fixtures
+            )
+        )
+        fixtures = _prioritize_unpublished(
+            visible_fixtures,
+            published_fixture_ids,
         )[:max_matches]
     except Exception as exc:
         raise DatabaseError('Could not read stored upcoming fixtures.') from exc
@@ -145,9 +171,8 @@ async def sync_and_predict(
     first_date = clock_utc.astimezone(local_tz).date()
 
     db = get_supabase()
-    api = ApiFootballClient(
-        request_log_sink=SupabaseRepository(client=db)
-    )
+    repository = SupabaseRepository(client=db)
+    api = ApiFootballClient(request_log_sink=repository)
     sync_results: list[dict[str, Any]] = []
     sync_stop: dict[str, str] | None = None
     fixtures: dict[int, dict[str, Any]] = {}
@@ -181,9 +206,23 @@ async def sync_and_predict(
             for row in result.rows:
                 fixtures[int(row['id'])] = row
 
+        stored_fixtures = await repository.stored_upcoming_fixtures(
+            league_ids=SYNC_LEAGUE_IDS,
+            start_kickoff=clock_utc.isoformat(),
+            end_kickoff=(clock_utc + timedelta(days=horizon)).isoformat(),
+            statuses=BASELINE_UPCOMING_STATUSES,
+            limit=None,
+        )
+        candidate_fixtures = {
+            int(row['id']): row
+            for row in stored_fixtures
+        }
+        # A just-synchronized fixture may have a temporarily missing status and
+        # therefore not appear in the stored-status query yet.
+        candidate_fixtures.update(fixtures)
         visible_fixtures = filter_visible_calendar_fixtures(
             db,
-            list(fixtures.values()),
+            list(candidate_fixtures.values()),
         )
         eligible = [
             row
@@ -191,7 +230,15 @@ async def sync_and_predict(
             if row.get('status_short') in NOT_STARTED_STATUSES
             and _kickoff_utc(row) > clock_utc
         ]
-        eligible.sort(key=_kickoff_utc)
+        published_fixture_ids = (
+            await repository.published_prediction_fixture_ids(
+                int(row['id']) for row in eligible
+            )
+        )
+        eligible = _prioritize_unpublished(
+            eligible,
+            published_fixture_ids,
+        )
 
         prediction_results: list[dict[str, Any]] = []
         for row in eligible[:limit]:
@@ -227,6 +274,7 @@ async def sync_and_predict(
         'max_matches': limit,
         'timezone': tz_name,
         'fixtures_synced': len(fixtures),
+        'stored_fixtures_found': len(stored_fixtures),
         'eligible_fixtures': len(eligible),
         'predictions_attempted': len(prediction_results),
         'predictions_succeeded': predicted,

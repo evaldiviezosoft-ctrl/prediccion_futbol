@@ -144,6 +144,8 @@ Para activar la sincronización diaria del backend:
 ```dotenv
 ENABLE_SCHEDULER=true
 SCHEDULER_RUN_ON_STARTUP=false
+SCHEDULER_HORIZON_DAYS=7
+SCHEDULER_PREDICTION_HORIZON_DAYS=14
 SCHEDULER_DAILY_HOUR=0
 SCHEDULER_DAILY_MINUTE=5
 DEFAULT_TIMEZONE=America/Lima
@@ -156,6 +158,11 @@ explícita. El programador reutiliza una sola instancia y cada trabajo admite
 como máximo una ejecución simultánea. Los límites
 `API_DAILY_SAFETY_RESERVE` y `API_MAX_REQUESTS_PER_RUN` siguen protegiendo la
 cuota gratuita.
+
+`SCHEDULER_HORIZON_DAYS` controla la sincronización con API-Football.
+`SCHEDULER_PREDICTION_HORIZON_DAYS` controla por separado el catch-up de
+predicciones desde partidos ya guardados; esta segunda fase no consume cuota
+del proveedor y procesa hasta 100 partidos por ciclo.
 
 El programador vive dentro del proceso FastAPI: si el equipo o servidor está
 apagado, no puede sincronizar. En un despliegue con varias réplicas se debe
