@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
@@ -71,7 +71,7 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
     assert scheduler is not None
     assert scheduler.running is True
     assert scheduler.timezone == ZoneInfo('America/Lima')
-    assert len(scheduler.jobs) == 1
+    assert len(scheduler.jobs) == 2
     function, job_options = scheduler.jobs[0]
     assert function is scheduler_service._scheduled_cycle
     assert job_options['id'] == 'sync-and-predict'
@@ -89,6 +89,12 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
         datetime(2026, 7, 23, 0, 6, tzinfo=ZoneInfo('America/Lima')),
     )
     assert next_daily_run == datetime(2026, 7, 24, 0, 5, tzinfo=ZoneInfo('America/Lima'))
+    lineup_function, lineup_options = scheduler.jobs[1]
+    assert lineup_function is scheduler_service._scheduled_lineup_cycle
+    assert lineup_options['id'] == 'sync-confirmed-lineups'
+    assert lineup_options['coalesce'] is True
+    assert lineup_options['max_instances'] == 1
+    assert lineup_options['replace_existing'] is True
 
 
 def test_daily_scheduler_waits_for_cron_by_default(monkeypatch):
@@ -217,6 +223,84 @@ def test_scheduled_cycle_contains_db_only_failure_after_successful_sync(
     assert 'Scheduled prediction cycle completed' in caplog.text
     assert 'Scheduled DB-only prediction catch-up failed: RuntimeError' in caplog.text
     assert 'private database details' not in caplog.text
+
+
+def test_lineup_cycle_filters_to_predictions_and_calibrates_only_confirmed(
+    monkeypatch,
+):
+    calls: dict[str, object] = {}
+
+    class Repository:
+        async def list_optional_fixture_candidates(self, **kwargs):
+            calls['window'] = kwargs
+            return [{'id': 11}, {'id': 22}]
+
+        async def published_prediction_fixture_ids(self, fixture_ids):
+            calls['candidate_ids'] = list(fixture_ids)
+            return {22}
+
+    class Api:
+        def __init__(self, *, request_log_sink):
+            calls['request_log_sink'] = request_log_sink
+
+        async def close(self):
+            calls['closed'] = True
+
+    class OptionalService:
+        def __init__(self, api, repository):
+            calls['service'] = (api, repository)
+
+        async def sync_many(self, fixtures, *, options, now):
+            calls['fixtures'] = fixtures
+            calls['lineups_enabled'] = options.lineups
+            calls['now'] = now
+            return SimpleNamespace(
+                lineups_downloaded=1,
+                confirmed_fixture_ids=[22],
+                skipped=0,
+            )
+
+    async def fake_refresh(fixture_id, **kwargs):
+        calls['refresh'] = (fixture_id, kwargs)
+
+    settings = _configured_settings(openai_configured=True)
+    repository = Repository()
+    database = object()
+    monkeypatch.setattr(scheduler_service, 'get_settings', lambda: settings)
+    monkeypatch.setattr(scheduler_service, 'get_supabase', lambda: database)
+    monkeypatch.setattr(
+        scheduler_service,
+        'SupabaseRepository',
+        lambda **_kwargs: repository,
+    )
+    monkeypatch.setattr(scheduler_service, 'ApiFootballClient', Api)
+    monkeypatch.setattr(
+        scheduler_service,
+        'OptionalFixtureSyncService',
+        OptionalService,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        'refresh_ai_calibration',
+        fake_refresh,
+    )
+
+    before = datetime.now(timezone.utc)
+    asyncio.run(scheduler_service._scheduled_lineup_cycle())
+    after = datetime.now(timezone.utc)
+
+    assert calls['candidate_ids'] == [11, 22]
+    assert calls['fixtures'] == [{'id': 22}]
+    assert calls['lineups_enabled'] is True
+    assert calls['closed'] is True
+    window = calls['window']
+    assert before <= window['starts_at'] <= after
+    assert window['ends_at'] - window['starts_at'] == timedelta(minutes=90)
+    fixture_id, refresh_kwargs = calls['refresh']
+    assert fixture_id == 22
+    assert refresh_kwargs['repository'] is repository
+    assert refresh_kwargs['db_client'] is database
+    assert refresh_kwargs['settings'] is settings
 
 
 def test_start_scheduler_reuses_the_single_running_instance(monkeypatch):

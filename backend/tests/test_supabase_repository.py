@@ -152,6 +152,157 @@ def test_ai_calibration_candidates_prioritize_never_calibrated_fixtures(
         reasoning_effort='max',
         prompt_version='football-calibrator-1.1',
         schema_version='ai-calibration-1.0',
+        processing_stale_before='2026-07-25T00:00:00+00:00',
+    ))
+
+    assert [row['fixture_id'] for row in rows] == [2]
+
+
+def test_ai_calibration_candidates_recover_only_expired_processing_leases(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    predictions = [
+        {
+            'fixture_id': fixture_id,
+            'kickoff': f'2026-07-26T{9 + fixture_id:02d}:00:00+00:00',
+            'updated_at': '2026-07-25T09:00:00+00:00',
+        }
+        for fixture_id in range(1, 5)
+    ]
+    common = {
+        'attempt_number': 1,
+        'retry_after': None,
+        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
+        'model': 'gpt-5.6-sol',
+        'reasoning_effort': 'high',
+        'prompt_version': 'football-calibrator-2.0',
+        'schema_version': 'ai-calibration-2.0',
+    }
+    attempts = [
+        {
+            **common,
+            'fixture_id': 1,
+            'status': 'processing',
+            'started_at': '2026-07-25T10:00:00+00:00',
+        },
+        {
+            **common,
+            'fixture_id': 2,
+            'status': 'processing',
+            'started_at': '2026-07-25T13:00:00+00:00',
+        },
+        {
+            **common,
+            'fixture_id': 3,
+            'status': 'error',
+            'started_at': None,
+        },
+        {
+            **common,
+            'fixture_id': 4,
+            'status': 'unavailable',
+            'started_at': None,
+        },
+    ]
+    calibration_columns = []
+
+    async def select(table, **kwargs):
+        if table == 'predictions':
+            return predictions
+        if table == 'prediction_calibrations':
+            calibration_columns.append(kwargs['columns'])
+            return attempts
+        raise AssertionError(table)
+
+    monkeypatch.setattr(repository, '_select', select)
+
+    rows = asyncio.run(repository.ai_calibration_candidates(
+        starts_at='2026-07-26T00:00:00+00:00',
+        ends_at='2026-07-27T00:00:00+00:00',
+        limit=10,
+        model='gpt-5.6-sol',
+        reasoning_effort='high',
+        prompt_version='football-calibrator-2.0',
+        schema_version='ai-calibration-2.0',
+        processing_stale_before='2026-07-25T12:00:00+00:00',
+    ))
+
+    assert [row['fixture_id'] for row in rows] == [1]
+    assert calibration_columns and 'started_at' in calibration_columns[0]
+
+
+def test_ai_candidates_refresh_only_on_the_first_confirmed_lineup_transition(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    predictions = [
+        {
+            'fixture_id': 1,
+            'kickoff': '2026-07-26T10:00:00+00:00',
+            'updated_at': '2026-07-25T11:00:00+00:00',
+            'lineups_confirmed': False,
+        },
+        {
+            'fixture_id': 2,
+            'kickoff': '2026-07-26T11:00:00+00:00',
+            'updated_at': '2026-07-25T11:00:00+00:00',
+            'lineups_confirmed': True,
+        },
+        {
+            'fixture_id': 3,
+            'kickoff': '2026-07-26T12:00:00+00:00',
+            'updated_at': '2026-07-25T11:00:00+00:00',
+            'lineups_confirmed': True,
+        },
+    ]
+    common = {
+        'attempt_number': 1,
+        'status': 'updated',
+        'retry_after': None,
+        'started_at': None,
+        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
+        'model': 'gpt-5.6-sol',
+        'reasoning_effort': 'high',
+        'prompt_version': 'football-calibrator-3.0',
+        'schema_version': 'ai-calibration-3.0',
+    }
+    attempts = [
+        {
+            **common,
+            'fixture_id': 1,
+            'analysis': {'lineups_considered': False},
+        },
+        {
+            **common,
+            'fixture_id': 2,
+            'analysis': {'lineups_considered': False},
+        },
+        {
+            **common,
+            'fixture_id': 3,
+            'analysis': {'lineups_considered': True},
+        },
+    ]
+
+    async def select(table, **_kwargs):
+        if table == 'predictions':
+            return predictions
+        if table == 'prediction_calibrations':
+            return attempts
+        raise AssertionError(table)
+
+    monkeypatch.setattr(repository, '_select', select)
+
+    rows = asyncio.run(repository.ai_calibration_candidates(
+        starts_at='2026-07-26T00:00:00+00:00',
+        ends_at='2026-07-27T00:00:00+00:00',
+        limit=10,
+        model='gpt-5.6-sol',
+        reasoning_effort='high',
+        prompt_version='football-calibrator-3.0',
+        schema_version='ai-calibration-3.0',
+        processing_stale_before='2026-07-25T00:00:00+00:00',
     ))
 
     assert [row['fixture_id'] for row in rows] == [2]
@@ -407,6 +558,62 @@ def test_targeted_team_history_query_is_not_restricted_to_modeled_leagues():
         kwargs['lt_values'] == {'kickoff': '2026-07-24T00:00:00+00:00'}
         for _, kwargs in calls
     )
+
+
+def test_targeted_team_history_can_be_restricted_to_the_target_competition():
+    repository = SupabaseRepository(client=object())
+    calls = []
+
+    async def select(table, **kwargs):
+        calls.append((table, kwargs))
+        return []
+
+    repository._select = select
+    rows = asyncio.run(repository.historical_finished_fixtures_for_team(
+        api_team_id=69,
+        kickoff='2026-07-24T00:00:00+00:00',
+        limit=12,
+        league_id=71,
+    ))
+
+    assert rows == []
+    assert [kwargs['equals'] for _, kwargs in calls] == [
+        {'home_team_id': 69, 'league_id': 71},
+        {'away_team_id': 69, 'league_id': 71},
+    ]
+
+
+def test_ai_calibration_loads_form_history_and_latest_global_rest_match():
+    repository = SupabaseRepository(client=object())
+    repository.published_prediction = AsyncMock(return_value={
+        'fixture_id': 901,
+        'league_id': 71,
+        'kickoff': '2026-07-28T22:00:00+00:00',
+        'home_team_id': 10,
+        'away_team_id': 20,
+    })
+    repository.prediction_fixture = AsyncMock(return_value={'id': 901})
+    repository.historical_finished_fixtures_for_team = AsyncMock(
+        return_value=[]
+    )
+    repository._select = AsyncMock(return_value=[])
+    repository.optional_sync_status = AsyncMock(return_value={})
+
+    source = asyncio.run(repository.ai_calibration_source_rows(901))
+
+    calls = [
+        item.kwargs
+        for item in (
+            repository.historical_finished_fixtures_for_team.await_args_list
+        )
+    ]
+    assert source['histories'] == {'home': [], 'away': []}
+    assert source['latest_histories'] == {'home': [], 'away': []}
+    assert len(calls) == 4
+    assert [
+        (call.get('league_id'), call['limit'])
+        for call in calls
+    ] == [(71, 12), (None, 1), (71, 12), (None, 1)]
 
 
 def test_mark_sync_component_pending_rejects_unknown_component():

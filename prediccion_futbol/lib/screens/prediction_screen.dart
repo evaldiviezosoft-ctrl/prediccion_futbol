@@ -4,6 +4,7 @@ import 'package:intl/intl.dart';
 import '../models/ai_calibration.dart';
 import '../models/fixture_summary.dart';
 import '../models/prediction.dart';
+import '../models/probable_forecast.dart';
 import '../repositories/football_data_source.dart';
 import '../theme/app_theme.dart';
 import '../widgets/team_mark.dart';
@@ -140,6 +141,11 @@ class _PredictionContent extends StatelessWidget {
           prediction,
           'home_shots_on_target',
           'away_shots_on_target',
+        ) ||
+        _hasCompleteExpectedPair(
+          prediction,
+          'home_yellow_cards',
+          'away_yellow_cards',
         );
     final isLowConfidenceFallback =
         fixture.predictionFallbackAvailable ||
@@ -167,9 +173,7 @@ class _PredictionContent extends StatelessWidget {
           ),
         _AiCalibrationSlot(
           stream: aiCalibrationStream,
-          homeTeam: prediction.homeTeam,
-          awayTeam: prediction.awayTeam,
-          showProbabilityComparison: !isSingleTeamFallback,
+          baseForecast: prediction.probableForecast,
           onRetry: onRetryAiCalibration,
         ),
         if (prediction.goalLines.isNotEmpty)
@@ -221,6 +225,30 @@ class _PredictionContent extends StatelessWidget {
                       'away_shots_on_target',
                     ),
                   ),
+                if (_hasCompleteExpectedPair(
+                  prediction,
+                  'home_yellow_cards',
+                  'away_yellow_cards',
+                )) ...[
+                  _StatRow(
+                    label: 'Tarjetas amarillas',
+                    icon: Icons.style_outlined,
+                    home: prediction.displayExpectedValue('home_yellow_cards'),
+                    away: prediction.displayExpectedValue('away_yellow_cards'),
+                  ),
+                  const Padding(
+                    padding: EdgeInsets.only(top: 10),
+                    child: Text(
+                      'Referencia histórica; se actualizará con los partidos '
+                      'recientes de la liga.',
+                      style: TextStyle(
+                        color: AppColors.muted,
+                        fontSize: 11,
+                        height: 1.35,
+                      ),
+                    ),
+                  ),
+                ],
                 if (prediction.isStatisticalBaseline) ...[
                   const SizedBox(height: 14),
                   _StatisticsSourceNotice(prediction: prediction),
@@ -228,35 +256,27 @@ class _PredictionContent extends StatelessWidget {
               ],
             ),
           ),
-        if (prediction.possibleScorers.isNotEmpty ||
-            prediction.isStatisticalBaseline ||
-            isLowConfidenceFallback)
+        if (prediction.possibleScorers.isNotEmpty)
           _Section(
             icon: Icons.sports_soccer_outlined,
             title: 'Goleadores probables',
-            child: prediction.possibleScorers.isEmpty
-                ? const _IndividualDataUnavailable()
-                : Column(
-                    children: prediction.possibleScorers
-                        .take(5)
-                        .map((player) => _PlayerProbabilityRow(player: player))
-                        .toList(),
-                  ),
+            child: Column(
+              children: prediction.possibleScorers
+                  .take(5)
+                  .map((player) => _PlayerProbabilityRow(player: player))
+                  .toList(),
+            ),
           ),
-        if (prediction.possibleAssistants.isNotEmpty ||
-            prediction.isStatisticalBaseline ||
-            isLowConfidenceFallback)
+        if (prediction.possibleAssistants.isNotEmpty)
           _Section(
             icon: Icons.assistant_outlined,
             title: 'Asistidores probables',
-            child: prediction.possibleAssistants.isEmpty
-                ? const _IndividualDataUnavailable()
-                : Column(
-                    children: prediction.possibleAssistants
-                        .take(5)
-                        .map((player) => _PlayerProbabilityRow(player: player))
-                        .toList(),
-                  ),
+            child: Column(
+              children: prediction.possibleAssistants
+                  .take(5)
+                  .map((player) => _PlayerProbabilityRow(player: player))
+                  .toList(),
+            ),
           ),
         _StatusFooter(
           prediction: prediction,
@@ -847,27 +867,6 @@ class _PlayerProbabilityRow extends StatelessWidget {
   }
 }
 
-class _IndividualDataUnavailable extends StatelessWidget {
-  const _IndividualDataUnavailable();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Icon(Icons.info_outline_rounded, color: AppColors.muted, size: 21),
-        SizedBox(width: 10),
-        Expanded(
-          child: Text(
-            'Aún no hay plantel o historial individual reciente suficiente.',
-            style: TextStyle(color: AppColors.muted, height: 1.4),
-          ),
-        ),
-      ],
-    );
-  }
-}
-
 class _StatisticsSourceNotice extends StatelessWidget {
   const _StatisticsSourceNotice({required this.prediction});
 
@@ -1146,6 +1145,14 @@ String _percent(double value) => '${(value * 100).round()}%';
 
 bool _hasExpectedPair(Prediction prediction, String homeKey, String awayKey) =>
     prediction.displayExpectedValue(homeKey) != null ||
+    prediction.displayExpectedValue(awayKey) != null;
+
+bool _hasCompleteExpectedPair(
+  Prediction prediction,
+  String homeKey,
+  String awayKey,
+) =>
+    prediction.displayExpectedValue(homeKey) != null &&
     prediction.displayExpectedValue(awayKey) != null;
 
 String _number(double? value) => value == null ? '—' : value.toStringAsFixed(1);

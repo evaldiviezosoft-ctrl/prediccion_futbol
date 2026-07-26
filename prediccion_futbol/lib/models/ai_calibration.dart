@@ -1,3 +1,5 @@
+import 'probable_forecast.dart';
+
 enum AiCalibrationStatus { pending, unavailable, error, updated }
 
 class AiProbabilityTriplet {
@@ -117,6 +119,13 @@ class AiContextDetail {
 
   final String label;
   final String value;
+}
+
+class AiCalibrationNote {
+  const AiCalibrationNote({required this.kind, required this.text});
+
+  final String kind;
+  final String text;
 }
 
 class AiProjectionRange {
@@ -277,6 +286,9 @@ class AiCalibrationAnalysis {
     required this.lineupsConsidered,
     required this.modelLabel,
     this.showOneXTwo = true,
+    this.notes,
+    this.probableForecast = const [],
+    this.forecastFinalized = false,
     this.recommendedMarket,
     this.conservativeAlternative,
   });
@@ -298,6 +310,11 @@ class AiCalibrationAnalysis {
   final bool lineupsConsidered;
   final String modelLabel;
   final bool showOneXTwo;
+  final List<AiCalibrationNote>? notes;
+  final List<ProbableForecastPick> probableForecast;
+  final bool forecastFinalized;
+
+  bool get usesCompactNotes => notes != null;
 
   factory AiCalibrationAnalysis.fromJson(Map<String, dynamic> json) {
     final base = AiProbabilityTriplet.fromJson(
@@ -357,6 +374,9 @@ class AiCalibrationAnalysis {
           _text(json['model_label'] ?? json['etiqueta_modelo']) ??
           'Calibración contextual IA',
       showOneXTwo: _boolean(json['show_1x2']) ?? true,
+      notes: _parseNotes(json),
+      probableForecast: parseProbableForecast(json['probable_forecast']),
+      forecastFinalized: _boolean(json['forecast_finalized']) ?? false,
     );
   }
 }
@@ -449,6 +469,25 @@ AiProbabilityTriplet? _parseProbabilityImpact(Map<dynamic, dynamic> value) {
     draw: draw / divisor,
     away: away / divisor,
   );
+}
+
+List<AiCalibrationNote>? _parseNotes(Map<String, dynamic> json) {
+  if (!json.containsKey('notes')) return null;
+  final value = json['notes'];
+  if (value is! List) return const [];
+  return value
+      .map((item) {
+        if (item is! Map) return null;
+        final text = _text(item['text']);
+        if (text == null) return null;
+        return AiCalibrationNote(
+          kind: _text(item['kind']) ?? 'note',
+          text: text,
+        );
+      })
+      .whereType<AiCalibrationNote>()
+      .take(5)
+      .toList(growable: false);
 }
 
 List<AiContextDetail> _parseContextDetails(Object? value) {

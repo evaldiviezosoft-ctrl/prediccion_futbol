@@ -61,7 +61,22 @@ BetMarket = Literal[
 ]
 BetConfidence = Literal['high', 'medium', 'low', 'no_bet']
 CalibrationStatus = Literal['pending', 'unavailable', 'error', 'updated']
-BoundedListText = Annotated[str, Field(min_length=1, max_length=300)]
+ForecastCategory = Literal[
+    'goals',
+    'corners',
+    'half_goals',
+    'cards',
+    'shots',
+    'saves',
+    'shots_on_target',
+]
+CalibrationNoteKind = Literal[
+    'adjustment',
+    'market',
+    'risk',
+    'missing_data',
+    'model_error',
+]
 
 
 class StrictModel(BaseModel):
@@ -92,7 +107,23 @@ class CalibrationAdjustment(StrictModel):
     impact_bps: int = Field(ge=-1_200, le=1_200)
     confidence: Confidence
     evidence_keys: list[EvidenceKey] = Field(min_length=1, max_length=5)
-    explanation: str = Field(min_length=1, max_length=500)
+
+
+class CalibrationNote(StrictModel):
+    """One short user-facing line produced by the model."""
+
+    kind: CalibrationNoteKind
+    text: Annotated[str, Field(min_length=1, max_length=160)]
+
+
+class ProbableForecastPick(StrictModel):
+    """A server-calculated prediction that the AI is not allowed to invent."""
+
+    category: ForecastCategory
+    title: Annotated[str, Field(min_length=1, max_length=80)]
+    prediction: Annotated[str, Field(min_length=1, max_length=100)]
+    probability: float | None = Field(default=None, ge=0, le=1)
+    confidence: Confidence
 
 
 class PreparationComparison(StrictModel):
@@ -159,7 +190,6 @@ class CalibrationProjections(StrictModel):
 class BetRecommendation(StrictModel):
     market: BetMarket
     confidence: BetConfidence
-    justification: str = Field(min_length=1, max_length=500)
     evidence_keys: list[EvidenceKey] = Field(max_length=5)
 
     @model_validator(mode='after')
@@ -171,20 +201,19 @@ class BetRecommendation(StrictModel):
 
 
 class AICalibrationModelOutput(StrictModel):
-    """Exact Structured Outputs schema sent to the OpenAI Responses API."""
+    """Compact Structured Outputs schema sent to the OpenAI Responses API.
+
+    Deterministic projections and verbose UI sections are deliberately absent:
+    the backend derives them after validating this small calibration decision.
+    """
 
     match_type: MatchType
     base_probabilities_bps: ProbabilityBps
     adjusted_probabilities_bps: ProbabilityBps
-    adjustments: list[CalibrationAdjustment] = Field(max_length=12)
-    preparation_comparison: PreparationComparison
-    rotation_effect: RotationEffect
-    projections: CalibrationProjections
+    adjustments: list[CalibrationAdjustment] = Field(max_length=5)
     recommended_market: BetRecommendation
     conservative_alternative: BetRecommendation
-    risks: list[BoundedListText] = Field(max_length=12)
-    missing_data: list[BoundedListText] = Field(max_length=20)
-    possible_model_errors: list[BoundedListText] = Field(max_length=12)
+    notes: list[CalibrationNote] = Field(max_length=5)
     refresh_with_lineups: bool
     data_quality: DataQuality
     lineups_considered: bool
@@ -235,6 +264,12 @@ class AICalibrationAnalysis(StrictModel):
     risks: list[str]
     missing_data: list[str]
     possible_model_errors: list[str]
+    notes: list[CalibrationNote] = Field(default_factory=list, max_length=5)
+    probable_forecast: list[ProbableForecastPick] = Field(
+        default_factory=list,
+        max_length=7,
+    )
+    forecast_finalized: bool = False
     refresh_with_lineups: bool
     data_quality: DataQuality
     lineups_considered: bool

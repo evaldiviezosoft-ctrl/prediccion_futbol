@@ -1,20 +1,34 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core.config import get_settings
-from app.services.ai_calibration_service import calibrate_stored_predictions
+from app.db.supabase_client import get_supabase
+from app.services.ai_calibration_service import (
+    calibrate_stored_predictions,
+    refresh_ai_calibration,
+)
+from app.services.api_football_client import ApiFootballClient
 from app.services.job_service import predict_stored_baselines, sync_and_predict
+from app.services.optional_fixture_sync_service import (
+    LINEUPS_EARLIEST_WINDOW,
+    OptionalFixtureSyncOptions,
+    OptionalFixtureSyncService,
+)
+from app.services.supabase_repository import SupabaseRepository
 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 _scheduler: AsyncIOScheduler | None = None
+LINEUP_POLL_INTERVAL_MINUTES = 15
+LINEUP_POLL_LIMIT = 100
 
 
 async def _scheduled_cycle() -> None:
@@ -80,6 +94,67 @@ async def _scheduled_cycle() -> None:
         )
 
 
+async def _scheduled_lineup_cycle() -> None:
+    """Poll only stored, predicted fixtures close enough to publish lineups."""
+
+    settings = get_settings()
+    database = get_supabase()
+    repository = SupabaseRepository(client=database)
+    api = ApiFootballClient(request_log_sink=repository)
+    now = datetime.now(timezone.utc)
+    try:
+        candidates = await repository.list_optional_fixture_candidates(
+            starts_at=now,
+            ends_at=now + LINEUPS_EARLIEST_WINDOW,
+            limit=LINEUP_POLL_LIMIT,
+        )
+        published_ids = await repository.published_prediction_fixture_ids(
+            int(row['id']) for row in candidates
+        )
+        predicted_candidates = [
+            row for row in candidates if int(row['id']) in published_ids
+        ]
+        result = await OptionalFixtureSyncService(api, repository).sync_many(
+            predicted_candidates,
+            options=OptionalFixtureSyncOptions(lineups=True),
+            now=now,
+        )
+    except Exception as exc:
+        logger.error(
+            'Scheduled lineup sync failed: %s',
+            type(exc).__name__,
+        )
+        return
+    finally:
+        await api.close()
+
+    logger.info(
+        'Scheduled lineup sync completed: candidates=%s downloaded=%s '
+        'confirmed=%s skipped=%s',
+        len(predicted_candidates),
+        result.lineups_downloaded,
+        len(result.confirmed_fixture_ids),
+        result.skipped,
+    )
+    if not getattr(settings, 'openai_configured', False):
+        return
+
+    for fixture_id in result.confirmed_fixture_ids:
+        try:
+            await refresh_ai_calibration(
+                fixture_id,
+                repository=repository,
+                db_client=database,
+                settings=settings,
+            )
+        except Exception as exc:
+            logger.error(
+                'Final lineup calibration failed for fixture %s: %s',
+                fixture_id,
+                type(exc).__name__,
+            )
+
+
 def start_scheduler() -> AsyncIOScheduler | None:
     global _scheduler
     settings = get_settings()
@@ -115,6 +190,17 @@ def start_scheduler() -> AsyncIOScheduler | None:
         _scheduled_cycle,
         trigger=trigger,
         **job_options,
+    )
+    scheduler.add_job(
+        _scheduled_lineup_cycle,
+        trigger=IntervalTrigger(
+            minutes=LINEUP_POLL_INTERVAL_MINUTES,
+            timezone=local_timezone,
+        ),
+        id='sync-confirmed-lineups',
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
     )
     scheduler.start()
     _scheduler = scheduler

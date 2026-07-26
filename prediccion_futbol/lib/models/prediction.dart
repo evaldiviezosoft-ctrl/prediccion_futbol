@@ -1,3 +1,5 @@
+import 'probable_forecast.dart';
+
 class GoalLineProbability {
   const GoalLineProbability({required this.line, required this.probability});
 
@@ -89,6 +91,7 @@ class Prediction {
     required this.possibleScorers,
     required this.possibleAssistants,
     required this.updatedAt,
+    this.probableForecast = const [],
     this.homeTeamCountry,
     this.awayTeamCountry,
     this.modelMetadata = const {},
@@ -110,6 +113,7 @@ class Prediction {
   final List<GoalLineProbability> goalLines;
   final List<PossibleScorer> possibleScorers;
   final List<PossibleScorer> possibleAssistants;
+  final List<ProbableForecastPick> probableForecast;
   final DateTime updatedAt;
   final Map<String, dynamic> modelMetadata;
 
@@ -257,6 +261,7 @@ class Prediction {
                 )
                 .toList()
           : const [],
+      probableForecast: parseProbableForecast(json['probable_forecast']),
       updatedAt: DateTime.parse(json['updated_at'] as String).toLocal(),
       modelMetadata: Map<String, dynamic>.from(
         json['model_metadata'] as Map? ?? const {},

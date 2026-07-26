@@ -338,6 +338,32 @@ def test_db_only_refresh_reuses_semantically_identical_persisted_prediction(
     assert second['kickoff'] == '2099-08-22T18:00:00Z'
 
 
+def test_prediction_refresh_never_reverts_confirmed_lineups():
+    db = RecordingDb()
+    stored = {
+        'fixture_id': 990,
+        'stage': 'lineups_confirmed',
+        'lineups_confirmed': True,
+        'updated_at': '2026-07-26T10:00:00+00:00',
+    }
+    db.predictions[990] = dict(stored)
+
+    result = prediction_service._persist_prediction(
+        db,
+        {
+            **stored,
+            'stage': 'waiting_lineups',
+            'lineups_confirmed': False,
+            'updated_at': '2026-07-26T10:05:00+00:00',
+        },
+    )
+
+    assert result['lineups_confirmed'] is True
+    assert result['stage'] == 'lineups_confirmed'
+    assert db.predictions[990]['lineups_confirmed'] is True
+    assert db.predictions[990]['stage'] == 'lineups_confirmed'
+
+
 @pytest.mark.parametrize(
     ('status_short', 'kickoff'),
     [

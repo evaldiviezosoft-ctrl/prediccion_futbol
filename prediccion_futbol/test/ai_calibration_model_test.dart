@@ -99,6 +99,16 @@ Map<String, dynamic> aiCalibrationJson() => {
     'risks': ['Alineaciones pendientes'],
     'missing_data': ['Cuotas recientes'],
     'possible_model_errors': ['Muestra reducida'],
+    'probable_forecast': [
+      {
+        'category': 'corners',
+        'title': 'Córners',
+        'prediction': 'Más de 7.5',
+        'probability': .71,
+        'confidence': 'medium',
+      },
+    ],
+    'forecast_finalized': false,
     'refresh_with_lineups': true,
     'data_quality': 'medium',
     'lineups_considered': false,
@@ -118,6 +128,9 @@ void main() {
       expect(analysis.adjustedProbabilities.home, .36);
       expect(analysis.adjustments.single.benefitedSide, 'away');
       expect(analysis.adjustments.single.impactPercentagePoints, 2);
+      expect(analysis.probableForecast.single.category, 'corners');
+      expect(analysis.probableForecast.single.prediction, 'Más de 7.5');
+      expect(analysis.forecastFinalized, isFalse);
       expect(
         analysis.adjustments.single.evidence,
         'historial reciente de los equipos',
@@ -183,6 +196,36 @@ void main() {
     final result = AiCalibrationResult.fromJson(json);
 
     expect(result.analysis!.showOneXTwo, isFalse);
+  });
+
+  test('prioriza y limita las notas del contrato público compacto', () {
+    final json = aiCalibrationJson();
+    final analysis = Map<String, dynamic>.from(json['analysis'] as Map)
+      ..['notes'] = [
+        {'kind': 'adjustment', 'text': 'Ajuste uno.'},
+        {'kind': 'market', 'text': 'Mercado dos.'},
+        {'kind': 'risk', 'text': 'Riesgo tres.'},
+        {'kind': 'missing_data', 'text': 'Dato cuatro.'},
+        {'kind': 'model_error', 'text': 'Límite cinco.'},
+        {'kind': 'risk', 'text': 'Esta nota se descarta.'},
+      ];
+    json['analysis'] = analysis;
+
+    final result = AiCalibrationResult.fromJson(json);
+
+    expect(result.analysis!.usesCompactNotes, isTrue);
+    expect(result.analysis!.notes, hasLength(5));
+    expect(result.analysis!.notes!.first.kind, 'adjustment');
+    expect(result.analysis!.notes!.last.text, 'Límite cinco.');
+  });
+
+  test('conserva el contrato narrativo legado si notes no está presente', () {
+    final result = AiCalibrationResult.fromJson(aiCalibrationJson());
+
+    expect(result.analysis!.usesCompactNotes, isFalse);
+    expect(result.analysis!.notes, isNull);
+    expect(result.analysis!.preparationComparison, isNotEmpty);
+    expect(result.analysis!.projections, isNotEmpty);
   });
 
   test(
