@@ -1246,6 +1246,40 @@ def test_published_calibration_from_old_prompt_is_marked_stale():
     assert result.is_stale is True
 
 
+def test_old_prompt_never_revives_forecast_for_an_unknown_opponent():
+    source = _source_rows()
+    repository = FakeRepository(source)
+    calibration = _stored_updated_calibration(
+        source,
+        attempt_number=1,
+        published=True,
+        model_label='Versión anterior',
+    )
+    calibration['prompt_version'] = 'football-calibrator-0.9'
+    repository.rows.append(calibration)
+    source['prediction']['model_metadata'].update({
+        'single_team_profile': True,
+        'known_profile_sides': ['home'],
+    })
+
+    result = asyncio.run(ai_calibration_service.get_ai_calibration_envelope(
+        901,
+        repository=repository,
+        prediction=source['prediction'],
+        settings=Settings(
+            _env_file=None,
+            openai_api_key='sk-test-only-012345678901234567890',
+        ),
+    ))
+
+    assert result.analysis is not None
+    categories = {
+        item.category for item in result.analysis.probable_forecast
+    }
+    assert 'goals' not in categories
+    assert 'half_goals' not in categories
+
+
 def test_public_reader_accepts_v1_calibration_without_notes():
     source = _source_rows()
     repository = FakeRepository(source)

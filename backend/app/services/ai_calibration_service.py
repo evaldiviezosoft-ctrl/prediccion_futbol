@@ -2079,7 +2079,20 @@ async def get_ai_calibration_envelope(
                 safe_message='No se pudo validar la calibración almacenada.',
                 is_stale=stale,
             )
-        if not analysis.probable_forecast:
+        current_forecast_contract = (
+            str(calibration.get('prompt_version')) == PROMPT_VERSION
+            and str(calibration.get('schema_version')) == SCHEMA_VERSION
+        )
+        if not current_forecast_contract:
+            # A legacy snapshot may not contain the provenance and one-sided
+            # profile gates required by the current deterministic forecast.
+            # While its replacement is queued, expose only today's safe base
+            # calculation instead of reviving an outdated market.
+            analysis = analysis.model_copy(update={
+                'probable_forecast': build_probable_forecast(prediction),
+                'forecast_finalized': analysis.lineups_considered,
+            })
+        elif not analysis.probable_forecast:
             analysis = analysis.model_copy(update={
                 'probable_forecast': _stored_probable_forecast(
                     calibration,
