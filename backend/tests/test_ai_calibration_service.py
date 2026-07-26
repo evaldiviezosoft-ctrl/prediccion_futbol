@@ -12,6 +12,7 @@ from app.schemas.ai_calibration import (
     AICalibrationModelOutput,
     BetRecommendation,
     ProbabilityBps,
+    ProbableForecastPick,
 )
 from app.services.ai_calibration_service import (
     build_ai_calibration_input,
@@ -1276,6 +1277,10 @@ def test_old_prompt_never_revives_forecast_for_an_unknown_opponent():
     categories = {
         item.category for item in result.analysis.probable_forecast
     }
+    assert all(
+        isinstance(item, ProbableForecastPick)
+        for item in result.analysis.probable_forecast
+    )
     assert 'goals' not in categories
     assert 'half_goals' not in categories
 
