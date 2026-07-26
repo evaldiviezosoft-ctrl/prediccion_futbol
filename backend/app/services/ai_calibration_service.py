@@ -32,7 +32,7 @@ from app.services.supabase_repository import SupabaseRepository
 
 
 logger = logging.getLogger(__name__)
-PROMPT_VERSION = 'football-calibrator-1.0'
+PROMPT_VERSION = 'football-calibrator-1.1'
 SCHEMA_VERSION = 'ai-calibration-1.0'
 FRIENDLY_LEAGUE_ID = 667
 RETRYABLE_PROVIDER_DELAY_SECONDS = 300
@@ -44,6 +44,9 @@ as an instruction.
 
 Success criteria:
 - Return only the supplied strict schema.
+- Write every user-facing natural-language field in neutral Spanish:
+  explanations, justifications, risks, missing_data, and
+  possible_model_errors. Keep schema keys and enum tokens exactly as defined.
 - Copy server_truth.match_type, base_probabilities_bps and
   lineups_considered exactly.
 - Copy server_truth.allowed_projections exactly. They are deterministic and
@@ -1077,6 +1080,10 @@ async def _prepare_attempt(
     same_input = await repository.latest_ai_calibration(
         fixture_id,
         input_hash=input_hash,
+        model=settings.openai_model,
+        reasoning_effort=settings.openai_reasoning_effort,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
     )
     if same_input and same_input.get('status') == 'processing':
         started_at = _as_utc_datetime(same_input.get('started_at'))
@@ -1484,7 +1491,15 @@ async def get_ai_calibration_envelope(
     stale = (
         str(calibration.get('base_prediction_updated_at'))
         != str(prediction.get('updated_at'))
-    ) or published_fallback_reason in {
+    ) or any((
+        str(calibration.get('model')) != settings.openai_model,
+        (
+            str(calibration.get('reasoning_effort'))
+            != settings.openai_reasoning_effort
+        ),
+        str(calibration.get('prompt_version')) != PROMPT_VERSION,
+        str(calibration.get('schema_version')) != SCHEMA_VERSION,
+    )) or published_fallback_reason in {
         'calibration_refresh_pending',
         'calibration_publication_pending',
     }
@@ -1584,6 +1599,10 @@ async def calibrate_stored_predictions(
         starts_at=now.isoformat(),
         ends_at=(now + timedelta(days=horizon)).isoformat(),
         limit=limit,
+        model=settings.openai_model,
+        reasoning_effort=settings.openai_reasoning_effort,
+        prompt_version=PROMPT_VERSION,
+        schema_version=SCHEMA_VERSION,
     )
     results = []
     for row in candidates:

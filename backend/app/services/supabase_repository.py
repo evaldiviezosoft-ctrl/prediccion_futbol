@@ -600,10 +600,22 @@ class SupabaseRepository:
         fixture_id: int,
         *,
         input_hash: str | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
+        prompt_version: str | None = None,
+        schema_version: str | None = None,
     ) -> dict[str, Any] | None:
         equals: dict[str, Any] = {'fixture_id': int(fixture_id)}
         if input_hash is not None:
             equals['input_hash'] = input_hash
+        if model is not None:
+            equals['model'] = model
+        if reasoning_effort is not None:
+            equals['reasoning_effort'] = reasoning_effort
+        if prompt_version is not None:
+            equals['prompt_version'] = prompt_version
+        if schema_version is not None:
+            equals['schema_version'] = schema_version
         rows = await self._select(
             'prediction_calibrations',
             equals=equals,
@@ -736,6 +748,10 @@ class SupabaseRepository:
         starts_at: str,
         ends_at: str,
         limit: int,
+        model: str,
+        reasoning_effort: str,
+        prompt_version: str,
+        schema_version: str,
     ) -> list[dict[str, Any]]:
         predictions = await self._select(
             'predictions',
@@ -757,7 +773,8 @@ class SupabaseRepository:
                 'prediction_calibrations',
                 columns=(
                     'fixture_id,attempt_number,status,retry_after,'
-                    'base_prediction_updated_at'
+                    'base_prediction_updated_at,model,reasoning_effort,'
+                    'prompt_version,schema_version'
                 ),
                 in_values={
                     'fixture_id': fixture_ids[
@@ -795,6 +812,14 @@ class SupabaseRepository:
             attempt = latest.get(fixture_id)
             if attempt is None:
                 never_calibrated.append(prediction)
+                continue
+            if any((
+                str(attempt.get('model')) != model,
+                str(attempt.get('reasoning_effort')) != reasoning_effort,
+                str(attempt.get('prompt_version')) != prompt_version,
+                str(attempt.get('schema_version')) != schema_version,
+            )):
+                refresh_candidates.append(prediction)
                 continue
             if str(attempt.get('base_prediction_updated_at')) != str(
                 prediction.get('updated_at')

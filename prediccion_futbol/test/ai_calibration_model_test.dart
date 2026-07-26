@@ -118,7 +118,22 @@ void main() {
       expect(analysis.adjustedProbabilities.home, .36);
       expect(analysis.adjustments.single.benefitedSide, 'away');
       expect(analysis.adjustments.single.impactPercentagePoints, 2);
-      expect(analysis.adjustments.single.evidence, 'team_history_summary');
+      expect(
+        analysis.adjustments.single.evidence,
+        'historial reciente de los equipos',
+      );
+      expect(
+        analysis.preparationComparison
+            .firstWhere((item) => item.label == 'Ventaja')
+            .value,
+        'visitante',
+      );
+      expect(
+        analysis.rotationEffect
+            .firstWhere((item) => item.label == 'Local')
+            .value,
+        contains('Confianza: baja'),
+      );
       expect(analysis.projections, hasLength(3));
       expect(
         analysis.projections

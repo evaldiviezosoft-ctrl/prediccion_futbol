@@ -277,11 +277,33 @@ class FakeRepository:
         assert fixture_id == 901
         return deepcopy(self.source)
 
-    async def latest_ai_calibration(self, fixture_id, *, input_hash=None):
+    async def latest_ai_calibration(
+        self,
+        fixture_id,
+        *,
+        input_hash=None,
+        model=None,
+        reasoning_effort=None,
+        prompt_version=None,
+        schema_version=None,
+    ):
         matches = [
             row for row in self.rows
             if row['fixture_id'] == fixture_id
             and (input_hash is None or row['input_hash'] == input_hash)
+            and (model is None or row.get('model') == model)
+            and (
+                reasoning_effort is None
+                or row.get('reasoning_effort') == reasoning_effort
+            )
+            and (
+                prompt_version is None
+                or row.get('prompt_version') == prompt_version
+            )
+            and (
+                schema_version is None
+                or row.get('schema_version') == schema_version
+            )
         ]
         return deepcopy(matches[-1]) if matches else None
 
@@ -428,6 +450,41 @@ def test_timestamp_only_base_rewrite_reuses_calibration_without_provider_call():
     )
 
 
+def test_prompt_version_change_creates_one_new_provider_attempt():
+    repository = FakeRepository(_source_rows())
+    responses = FakeResponses(_model_output())
+    settings = Settings(
+        _env_file=None,
+        openai_api_key='sk-test-only-012345678901234567890',
+    )
+    client = SimpleNamespace(responses=responses)
+
+    first = asyncio.run(refresh_ai_calibration(
+        901,
+        db_client=object(),
+        repository=repository,
+        openai_client=client,
+        settings=settings,
+    ))
+    repository.rows[-1]['prompt_version'] = 'football-calibrator-0.9'
+    second = asyncio.run(refresh_ai_calibration(
+        901,
+        db_client=object(),
+        repository=repository,
+        openai_client=client,
+        settings=settings,
+    ))
+
+    assert first.status == 'updated'
+    assert second.status == 'updated'
+    assert len(responses.calls) == 2
+    assert len(repository.rows) == 2
+    assert repository.rows[-1]['attempt_number'] == 2
+    assert repository.rows[-1]['prompt_version'] == (
+        ai_calibration_service.PROMPT_VERSION
+    )
+
+
 def test_no_bet_has_no_threshold_or_edge():
     context = build_ai_calibration_input(_source_rows())
     output = _model_output().model_copy(update={
@@ -546,6 +603,10 @@ def _seed_processing_attempt(repository, settings, *, started_at):
         'attempt_number': 1,
         'input_hash': input_hash,
         'status': 'processing',
+        'model': settings.openai_model,
+        'reasoning_effort': settings.openai_reasoning_effort,
+        'prompt_version': ai_calibration_service.PROMPT_VERSION,
+        'schema_version': ai_calibration_service.SCHEMA_VERSION,
         'started_at': started_at,
         'retry_after': None,
         'base_prediction_updated_at': (
@@ -665,6 +726,10 @@ def _stored_updated_calibration(
         'input_hash': f'{attempt_number:064x}',
         'status': 'updated',
         'published': published,
+        'model': 'gpt-5.6-sol',
+        'reasoning_effort': 'max',
+        'prompt_version': ai_calibration_service.PROMPT_VERSION,
+        'schema_version': ai_calibration_service.SCHEMA_VERSION,
         'base_prediction_updated_at': source['prediction']['updated_at'],
         'generated_at': '2026-07-25T10:05:00+00:00',
         'analysis': analysis,
@@ -730,6 +795,32 @@ def test_unpublished_attempt_uses_last_published_calibration_as_fallback():
     assert result.is_stale is True
 
 
+def test_published_calibration_from_old_prompt_is_marked_stale():
+    source = _source_rows()
+    repository = FakeRepository(source)
+    calibration = _stored_updated_calibration(
+        source,
+        attempt_number=1,
+        published=True,
+        model_label='Versión anterior',
+    )
+    calibration['prompt_version'] = 'football-calibrator-0.9'
+    repository.rows.append(calibration)
+
+    result = asyncio.run(ai_calibration_service.get_ai_calibration_envelope(
+        901,
+        repository=repository,
+        prediction=source['prediction'],
+        settings=Settings(
+            _env_file=None,
+            openai_api_key='sk-test-only-012345678901234567890',
+        ),
+    ))
+
+    assert result.status == 'updated'
+    assert result.is_stale is True
+
+
 def test_pending_analysis_get_enqueues_idempotent_background_refresh(monkeypatch):
     async def pending(_fixture_id):
         return ai_calibration_service.AICalibrationEnvelope(
@@ -758,3 +849,10 @@ def test_pending_analysis_get_enqueues_idempotent_background_refresh(monkeypatch
     assert len(background.tasks) == 1
     assert background.tasks[0].func is prediction_routes.refresh_ai_calibration
     assert background.tasks[0].args == (901,)
+
+
+def test_developer_prompt_requires_neutral_spanish_user_facing_text():
+    prompt = ai_calibration_service.DEVELOPER_PROMPT
+
+    assert 'neutral Spanish' in prompt
+    assert 'Keep schema keys and enum tokens exactly as defined' in prompt
