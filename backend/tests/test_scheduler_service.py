@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 from datetime import datetime
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -50,6 +52,7 @@ def _configured_settings(**overrides):
         'default_timezone': 'America/Lima',
         'scheduler_daily_hour': 0,
         'scheduler_daily_minute': 5,
+        'scheduler_prediction_horizon_days': 14,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -99,6 +102,123 @@ def test_daily_scheduler_waits_for_cron_by_default(monkeypatch):
     assert 'next_run_time' not in job_options
 
 
+def test_scheduled_cycle_runs_db_only_catch_up_with_prediction_horizon(
+    monkeypatch,
+    caplog,
+):
+    calls: list[tuple[str, dict[str, int]]] = []
+
+    async def fake_sync_and_predict():
+        calls.append(('sync', {}))
+        return {
+            'predictions_attempted': 2,
+            'predictions_succeeded': 1,
+            'predictions_failed': 1,
+        }
+
+    async def fake_predict_stored_baselines(**kwargs):
+        calls.append(('catch_up', kwargs))
+        return {
+            'fixtures_found': 8,
+            'predictions_attempted': 8,
+            'predictions_succeeded': 7,
+            'predictions_failed': 1,
+            'provider_requests': 0,
+        }
+
+    monkeypatch.setattr(scheduler_service, 'sync_and_predict', fake_sync_and_predict)
+    monkeypatch.setattr(
+        scheduler_service,
+        'predict_stored_baselines',
+        fake_predict_stored_baselines,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        'get_settings',
+        lambda: _configured_settings(scheduler_prediction_horizon_days=9),
+    )
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_cycle())
+
+    assert calls == [
+        ('sync', {}),
+        ('catch_up', {'horizon_days': 9, 'max_matches': 100}),
+    ]
+    assert 'provider_requests=0' in caplog.text
+
+
+def test_scheduled_cycle_still_runs_db_only_catch_up_when_sync_fails(
+    monkeypatch,
+    caplog,
+):
+    catch_up_calls = []
+
+    async def failing_sync_and_predict():
+        raise RuntimeError('private provider details')
+
+    async def fake_predict_stored_baselines(**kwargs):
+        catch_up_calls.append(kwargs)
+        return {
+            'fixtures_found': 1,
+            'predictions_attempted': 1,
+            'predictions_succeeded': 1,
+            'predictions_failed': 0,
+            'provider_requests': 0,
+        }
+
+    monkeypatch.setattr(scheduler_service, 'sync_and_predict', failing_sync_and_predict)
+    monkeypatch.setattr(
+        scheduler_service,
+        'predict_stored_baselines',
+        fake_predict_stored_baselines,
+    )
+    monkeypatch.setattr(scheduler_service, 'get_settings', _configured_settings)
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_cycle())
+
+    assert catch_up_calls == [{'horizon_days': 14, 'max_matches': 100}]
+    assert 'Scheduled prediction cycle failed: RuntimeError' in caplog.text
+    assert 'Scheduled DB-only prediction catch-up completed' in caplog.text
+    assert 'private provider details' not in caplog.text
+
+
+def test_scheduled_cycle_contains_db_only_failure_after_successful_sync(
+    monkeypatch,
+    caplog,
+):
+    sync_calls = 0
+
+    async def fake_sync_and_predict():
+        nonlocal sync_calls
+        sync_calls += 1
+        return {
+            'predictions_attempted': 1,
+            'predictions_succeeded': 1,
+            'predictions_failed': 0,
+        }
+
+    async def failing_predict_stored_baselines(**_kwargs):
+        raise RuntimeError('private database details')
+
+    monkeypatch.setattr(scheduler_service, 'sync_and_predict', fake_sync_and_predict)
+    monkeypatch.setattr(
+        scheduler_service,
+        'predict_stored_baselines',
+        failing_predict_stored_baselines,
+    )
+    monkeypatch.setattr(scheduler_service, 'get_settings', _configured_settings)
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_cycle())
+
+    assert sync_calls == 1
+    assert 'Scheduled prediction cycle completed' in caplog.text
+    assert 'Scheduled DB-only prediction catch-up failed: RuntimeError' in caplog.text
+    assert 'private database details' not in caplog.text
+
+
 def test_start_scheduler_reuses_the_single_running_instance(monkeypatch):
     monkeypatch.setattr(scheduler_service, 'AsyncIOScheduler', FakeAsyncIOScheduler)
     monkeypatch.setattr(scheduler_service, 'get_settings', _configured_settings)
@@ -127,6 +247,19 @@ def test_start_scheduler_reuses_the_single_running_instance(monkeypatch):
 def test_daily_scheduler_time_settings_reject_invalid_values(field_name, invalid_value):
     with pytest.raises(ValidationError):
         Settings(_env_file=None, **{field_name: invalid_value})
+
+
+def test_db_only_prediction_horizon_defaults_to_fourteen_days():
+    assert Settings(_env_file=None).scheduler_prediction_horizon_days == 14
+
+
+@pytest.mark.parametrize('invalid_value', (0, 31))
+def test_db_only_prediction_horizon_rejects_invalid_values(invalid_value):
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            scheduler_prediction_horizon_days=invalid_value,
+        )
 
 
 def test_scheduler_does_not_start_with_invalid_timezone(monkeypatch):

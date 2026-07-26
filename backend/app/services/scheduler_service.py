@@ -8,10 +8,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import get_settings
-from app.services.job_service import sync_and_predict
+from app.services.job_service import predict_stored_baselines, sync_and_predict
 
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 _scheduler: AsyncIOScheduler | None = None
 
 
@@ -26,6 +27,27 @@ async def _scheduled_cycle() -> None:
         )
     except Exception as exc:
         logger.error('Scheduled prediction cycle failed: %s', type(exc).__name__)
+
+    try:
+        settings = get_settings()
+        catch_up = await predict_stored_baselines(
+            horizon_days=settings.scheduler_prediction_horizon_days,
+            max_matches=100,
+        )
+        logger.info(
+            'Scheduled DB-only prediction catch-up completed: '
+            'found=%s attempted=%s succeeded=%s failed=%s provider_requests=%s',
+            catch_up['fixtures_found'],
+            catch_up['predictions_attempted'],
+            catch_up['predictions_succeeded'],
+            catch_up['predictions_failed'],
+            catch_up['provider_requests'],
+        )
+    except Exception as exc:
+        logger.error(
+            'Scheduled DB-only prediction catch-up failed: %s',
+            type(exc).__name__,
+        )
 
 
 def start_scheduler() -> AsyncIOScheduler | None:

@@ -75,6 +75,7 @@ class Settings(BaseSettings):
     scheduler_run_on_startup: bool = False
     max_matches_per_scheduler_cycle: int = Field(default=5, ge=1, le=25)
     scheduler_horizon_days: int = Field(default=7, ge=1, le=30)
+    scheduler_prediction_horizon_days: int = Field(default=14, ge=1, le=30)
     scheduler_daily_hour: int = Field(default=0, ge=0, le=23)
     scheduler_daily_minute: int = Field(default=5, ge=0, le=59)
     default_timezone: str = 'America/Lima'

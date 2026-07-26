@@ -407,7 +407,7 @@ class SupabaseRepository:
         start_kickoff: str,
         end_kickoff: str,
         statuses: Iterable[str],
-        limit: int,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         return await self._select(
             'fixtures',
@@ -422,8 +422,34 @@ class SupabaseRepository:
             gte_values={'kickoff': start_kickoff},
             lte_values={'kickoff': end_kickoff},
             order_by=('kickoff', False),
-            limit=int(limit),
+            limit=None if limit is None else int(limit),
         )
+
+    async def published_prediction_fixture_ids(
+        self,
+        fixture_ids: Iterable[int],
+    ) -> set[int]:
+        """Return fixtures that already have a published prediction."""
+
+        ids = sorted({int(value) for value in fixture_ids})
+        published: set[int] = set()
+        for index in range(0, len(ids), POSTGREST_IN_FILTER_CHUNK_SIZE):
+            rows = await self._select(
+                'predictions',
+                columns='fixture_id',
+                equals={'published': True},
+                in_values={
+                    'fixture_id': ids[
+                        index:index + POSTGREST_IN_FILTER_CHUNK_SIZE
+                    ],
+                },
+            )
+            published.update(
+                int(row['fixture_id'])
+                for row in rows
+                if row.get('fixture_id') is not None
+            )
+        return published
 
     async def ensure_legacy_league(self, competition: Mapping[str, Any]) -> None:
         api_league_id = competition.get('api_league_id')
