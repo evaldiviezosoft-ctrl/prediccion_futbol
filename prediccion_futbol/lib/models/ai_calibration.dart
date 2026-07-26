@@ -622,7 +622,10 @@ List<String> _stringList(Object? value) {
 
 String? _readableValue(Object? value) {
   if (value == null) return null;
-  if (value is String) return _text(value);
+  if (value is String) {
+    final text = _text(value);
+    return text == null ? null : _localizedAiValue(text);
+  }
   if (value is num || value is bool) return value.toString();
   if (value is List) {
     final values = value.map(_readableValue).whereType<String>().toList();
@@ -642,6 +645,26 @@ String? _readableValue(Object? value) {
   }
   return null;
 }
+
+String _localizedAiValue(String value) => switch (value.toLowerCase()) {
+  'home' => 'local',
+  'away' => 'visitante',
+  'neither' => 'ninguno',
+  'balanced' => 'equilibrado',
+  'high' => 'alta',
+  'medium' => 'media',
+  'low' => 'baja',
+  'fixture_metadata' => 'datos del partido',
+  'base_prediction' => 'modelo estadístico base',
+  'model_metadata' => 'metadatos del modelo',
+  'feature_snapshot' => 'variables del modelo',
+  'team_history_summary' => 'historial reciente de los equipos',
+  'team_statistics_summary' => 'estadísticas recientes de los equipos',
+  'lineup_snapshot' => 'alineaciones',
+  'injury_snapshot' => 'ausencias registradas',
+  'odds_snapshot' => 'cuotas recientes',
+  _ => value,
+};
 
 String _humanize(String value) {
   final known = switch (value.toLowerCase()) {

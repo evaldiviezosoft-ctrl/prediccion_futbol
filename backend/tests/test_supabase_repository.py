@@ -129,6 +129,10 @@ def test_ai_calibration_candidates_prioritize_never_calibrated_fixtures(
         'status': 'updated',
         'retry_after': None,
         'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
+        'model': 'gpt-5.6-sol',
+        'reasoning_effort': 'max',
+        'prompt_version': 'football-calibrator-1.1',
+        'schema_version': 'ai-calibration-1.0',
     }]
 
     async def select(table, **_kwargs):
@@ -144,6 +148,10 @@ def test_ai_calibration_candidates_prioritize_never_calibrated_fixtures(
         starts_at='2026-07-26T00:00:00+00:00',
         ends_at='2026-07-27T00:00:00+00:00',
         limit=1,
+        model='gpt-5.6-sol',
+        reasoning_effort='max',
+        prompt_version='football-calibrator-1.1',
+        schema_version='ai-calibration-1.0',
     ))
 
     assert [row['fixture_id'] for row in rows] == [2]
