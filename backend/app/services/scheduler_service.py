@@ -8,6 +8,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from app.core.config import get_settings
+from app.services.ai_calibration_service import calibrate_stored_predictions
 from app.services.job_service import predict_stored_baselines, sync_and_predict
 
 
@@ -46,6 +47,35 @@ async def _scheduled_cycle() -> None:
     except Exception as exc:
         logger.error(
             'Scheduled DB-only prediction catch-up failed: %s',
+            type(exc).__name__,
+        )
+
+    try:
+        settings = get_settings()
+        if getattr(settings, 'openai_configured', False):
+            calibrated = await calibrate_stored_predictions(
+                horizon_days=getattr(
+                    settings,
+                    'ai_calibration_horizon_days',
+                    settings.scheduler_prediction_horizon_days,
+                ),
+                max_matches=getattr(
+                    settings,
+                    'ai_calibration_max_per_cycle',
+                    10,
+                ),
+                settings=settings,
+            )
+            logger.info(
+                'Scheduled AI calibration completed: attempted=%s '
+                'updated=%s failed=%s',
+                calibrated['attempted'],
+                calibrated['updated'],
+                calibrated['failed'],
+            )
+    except Exception as exc:
+        logger.error(
+            'Scheduled AI calibration failed: %s',
             type(exc).__name__,
         )
 

@@ -1,3 +1,4 @@
+import '../models/ai_calibration.dart';
 import '../models/backend_health.dart';
 import '../models/fixture_summary.dart';
 import '../models/prediction.dart';
@@ -110,10 +111,65 @@ class DemoFootballRepository implements FootballDataSource {
       ],
       updatedAt: now.subtract(const Duration(minutes: 2)),
     );
+    aiCalibration = AiCalibrationResult.fromJson({
+      'fixture_id': 1001,
+      'status': 'updated',
+      'generated_at': now.toUtc().toIso8601String(),
+      'is_stale': false,
+      'analysis': {
+        'match_type': 'official',
+        'base_probabilities': {'home': .58, 'draw': .24, 'away': .18},
+        'adjusted_probabilities': {'home': .55, 'draw': .25, 'away': .20},
+        'adjustments': [
+          {
+            'factor': 'Forma y nivel de oposición',
+            'detail':
+                'La muestra reciente reduce ligeramente la ventaja inicial del local.',
+            'evidence': 'Últimos partidos comparables disponibles',
+          },
+        ],
+        'preparation_comparison': {
+          'local': 'Carga estable y continuidad reciente',
+          'visitante': 'Calendario con menor descanso',
+        },
+        'rotation_effect': {'resumen': 'Alineaciones aún no confirmadas'},
+        'projections': {
+          'goals': {
+            'home': {'min': 1, 'max': 3},
+            'away': {'min': 0, 'max': 2},
+          },
+          'corners': {
+            'home': {'min': 5, 'max': 8},
+            'away': {'min': 3, 'max': 5},
+          },
+        },
+        'recommended_market': {
+          'market': 'btts_yes',
+          'confidence': 'medium',
+          'justification':
+              'Es el mercado con mayor respaldo del modelo y la calibración.',
+          'market_data_available': false,
+        },
+        'conservative_alternative': {
+          'market': 'Local o empate',
+          'confidence': 'medium',
+          'justification': 'Reduce la exposición ante un empate.',
+          'market_data_available': false,
+        },
+        'risks': ['Alineaciones pendientes'],
+        'missing_data': ['Cuotas recientes'],
+        'possible_model_errors': ['Muestra reciente limitada'],
+        'refresh_with_lineups': true,
+        'data_quality': 'medium',
+        'lineups_considered': false,
+        'model_label': 'Calibración contextual IA',
+      },
+    });
   }
 
   late final List<FixtureSummary> fixtures;
   late final Prediction prediction;
+  late final AiCalibrationResult aiCalibration;
 
   @override
   Future<BackendHealth> checkHealth() async =>
@@ -127,6 +183,19 @@ class DemoFootballRepository implements FootballDataSource {
   Stream<Prediction?> watchPrediction(int fixtureId) =>
       Stream<Prediction?>.value(
         fixtureId == prediction.fixtureId ? prediction : null,
+      );
+
+  @override
+  Stream<AiCalibrationResult> watchAiCalibration(int fixtureId) =>
+      Stream<AiCalibrationResult>.value(
+        fixtureId == prediction.fixtureId
+            ? aiCalibration
+            : AiCalibrationResult(
+                fixtureId: fixtureId,
+                status: AiCalibrationStatus.unavailable,
+                isStale: false,
+                safeMessage: 'El análisis contextual no está disponible.',
+              ),
       );
 
   @override

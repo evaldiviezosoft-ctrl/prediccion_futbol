@@ -154,6 +154,31 @@ class SupabaseRepository:
 
         return await asyncio.to_thread(execute)
 
+    async def _update(
+        self,
+        table: str,
+        changes: Mapping[str, Any],
+        *,
+        equals: Mapping[str, Any],
+        in_values: Mapping[str, Iterable[Any]] | None = None,
+        select: str = '*',
+    ) -> list[dict[str, Any]]:
+        filters = {key: list(values) for key, values in (in_values or {}).items()}
+        if any(not values for values in filters.values()):
+            return []
+
+        def execute() -> list[dict[str, Any]]:
+            query = self._client.table(table).update(dict(changes))
+            for column, value in equals.items():
+                query = query.eq(column, value)
+            for column, values in filters.items():
+                query = query.in_(column, values)
+            if select:
+                query = query.select(select)
+            return _response_rows(query.execute())
+
+        return await asyncio.to_thread(execute)
+
     async def _select(
         self,
         table: str,
@@ -450,6 +475,338 @@ class SupabaseRepository:
                 if row.get('fixture_id') is not None
             )
         return published
+
+    async def published_prediction(
+        self,
+        fixture_id: int,
+    ) -> dict[str, Any] | None:
+        rows = await self._select(
+            'predictions',
+            columns=(
+                'fixture_id,league_id,league_code,home_team_id,away_team_id,'
+                'home_team_name,away_team_name,kickoff,stage,lineups_confirmed,'
+                'home_win_probability,draw_probability,away_win_probability,'
+                'over25_probability,btts_probability,expected,possible_scorers,'
+                'model_metadata,features_snapshot,published,updated_at'
+            ),
+            equals={'fixture_id': int(fixture_id), 'published': True},
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def ai_calibration_source_rows(
+        self,
+        fixture_id: int,
+        *,
+        history_limit: int = 12,
+    ) -> dict[str, Any] | None:
+        """Load only evidence explicitly admitted to the AI calibration input.
+
+        Raw provider payloads and headers are deliberately excluded here. Odds
+        are the sole exception at rest, and the service immediately reduces
+        their latest stored payload to a numeric market snapshot.
+        """
+
+        prediction = await self.published_prediction(fixture_id)
+        if prediction is None:
+            return None
+        fixture = await self.prediction_fixture(fixture_id)
+        if fixture is None:
+            return None
+        kickoff = str(prediction['kickoff'])
+        histories: dict[str, list[dict[str, Any]]] = {}
+        for side in ('home', 'away'):
+            histories[side] = await self.historical_finished_fixtures_for_team(
+                api_team_id=int(prediction[f'{side}_team_id']),
+                kickoff=kickoff,
+                limit=history_limit,
+            )
+        fixture_ids = {
+            int(row['id'])
+            for rows in histories.values()
+            for row in rows
+            if row.get('id') is not None
+        }
+        statistics = (
+            await self.team_statistics_for_fixtures(fixture_ids)
+            if fixture_ids
+            else []
+        )
+        lineups = await self._select(
+            'lineups',
+            columns='id,fixture_id,team_id,formation,confirmed,fetched_at',
+            equals={'fixture_id': int(fixture_id)},
+        )
+        lineup_ids = [
+            int(row['id']) for row in lineups if row.get('id') is not None
+        ]
+        lineup_players = (
+            await self._select(
+                'lineup_players',
+                columns=(
+                    'lineup_id,lineup_order,api_player_id,player_name,number,'
+                    'position,starter,substitute'
+                ),
+                in_values={'lineup_id': lineup_ids},
+                order_by=('lineup_order', False),
+            )
+            if lineup_ids
+            else []
+        )
+        internal_team_ids = {
+            int(row['team_id'])
+            for row in lineups
+            if row.get('team_id') is not None
+        }
+        lineup_teams = (
+            await self._select(
+                'teams',
+                columns='id,api_team_id,name,country',
+                in_values={'id': internal_team_ids},
+            )
+            if internal_team_ids
+            else []
+        )
+        injuries = await self._select(
+            'fixture_injuries',
+            columns=(
+                'api_team_id,api_player_id,injury_type,reason,fetched_at,active'
+            ),
+            equals={'fixture_id': int(fixture_id), 'active': True},
+        )
+        odds = await self._select(
+            'fixture_odds_snapshots',
+            columns='fetched_at,raw_json',
+            equals={'fixture_id': int(fixture_id)},
+            order_by=('fetched_at', True),
+            limit=1,
+        )
+        optional_status = await self.optional_sync_status(fixture_id)
+        return {
+            'prediction': prediction,
+            'fixture': fixture,
+            'histories': histories,
+            'statistics': statistics,
+            'lineups': lineups,
+            'lineup_players': lineup_players,
+            'lineup_teams': lineup_teams,
+            'injuries': injuries,
+            'odds': odds[0] if odds else None,
+            'optional_status': optional_status,
+        }
+
+    async def latest_ai_calibration(
+        self,
+        fixture_id: int,
+        *,
+        input_hash: str | None = None,
+    ) -> dict[str, Any] | None:
+        equals: dict[str, Any] = {'fixture_id': int(fixture_id)}
+        if input_hash is not None:
+            equals['input_hash'] = input_hash
+        rows = await self._select(
+            'prediction_calibrations',
+            equals=equals,
+            order_by=('attempt_number', True),
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def published_ai_calibration(
+        self,
+        fixture_id: int,
+    ) -> dict[str, Any] | None:
+        rows = await self._select(
+            'prediction_calibrations',
+            equals={
+                'fixture_id': int(fixture_id),
+                'status': 'updated',
+                'published': True,
+            },
+            order_by=('attempt_number', True),
+            limit=1,
+        )
+        return rows[0] if rows else None
+
+    async def insert_ai_calibration_attempt(
+        self,
+        row: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Insert an immutable attempt identity, replaying on idempotency key."""
+
+        inserted = await self._upsert(
+            'prediction_calibrations',
+            row,
+            on_conflict='idempotency_key',
+            select='*',
+            ignore_duplicates=True,
+        )
+        if inserted:
+            return inserted[0]
+        existing = await self._select(
+            'prediction_calibrations',
+            equals={'idempotency_key': str(row['idempotency_key'])},
+            limit=1,
+        )
+        if not existing:
+            raise RuntimeError('Could not create or recover AI calibration attempt.')
+        return existing[0]
+
+    async def claim_ai_calibration(
+        self,
+        calibration_id: str,
+        *,
+        started_at: str,
+    ) -> dict[str, Any] | None:
+        rows = await self._update(
+            'prediction_calibrations',
+            {
+                'status': 'processing',
+                'started_at': started_at,
+                'retry_after': None,
+                'safe_message': None,
+                'reason_code': None,
+                'safe_error_message': None,
+            },
+            equals={'id': calibration_id, 'status': 'pending'},
+        )
+        return rows[0] if rows else None
+
+    async def update_ai_calibration(
+        self,
+        calibration_id: str,
+        changes: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        rows = await self._update(
+            'prediction_calibrations',
+            changes,
+            equals={'id': calibration_id},
+        )
+        return rows[0] if rows else None
+
+    async def recover_stale_ai_calibration(
+        self,
+        calibration_id: str,
+        *,
+        started_at: str,
+    ) -> dict[str, Any] | None:
+        rows = await self._update(
+            'prediction_calibrations',
+            {
+                'status': 'pending',
+                'started_at': None,
+                'completed_at': None,
+                'generated_at': None,
+                'retry_after': None,
+                'reason_code': 'stale_processing_recovered',
+                'safe_message': (
+                    'La calibración interrumpida se reintentará automáticamente.'
+                ),
+                'safe_error_message': None,
+            },
+            equals={
+                'id': calibration_id,
+                'status': 'processing',
+                'started_at': started_at,
+            },
+        )
+        return rows[0] if rows else None
+
+    async def publish_ai_calibration(
+        self,
+        calibration_id: str,
+    ) -> dict[str, Any]:
+        """Atomically replace the currently published attempt for a fixture."""
+
+        def execute() -> list[dict[str, Any]]:
+            response = self._client.rpc(
+                'publish_prediction_calibration',
+                {'p_calibration_id': calibration_id},
+            ).execute()
+            return _response_rows(response)
+
+        rows = await asyncio.to_thread(execute)
+        if not rows:
+            raise RuntimeError('AI calibration publication returned no row.')
+        return rows[0]
+
+    async def ai_calibration_candidates(
+        self,
+        *,
+        starts_at: str,
+        ends_at: str,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        predictions = await self._select(
+            'predictions',
+            columns='fixture_id,kickoff,updated_at',
+            equals={'published': True},
+            gte_values={'kickoff': starts_at},
+            lte_values={'kickoff': ends_at},
+            order_by=('kickoff', False),
+            limit=None,
+        )
+        fixture_ids = [
+            int(row['fixture_id'])
+            for row in predictions
+            if row.get('fixture_id') is not None
+        ]
+        attempts: list[dict[str, Any]] = []
+        for index in range(0, len(fixture_ids), POSTGREST_IN_FILTER_CHUNK_SIZE):
+            attempts.extend(await self._select(
+                'prediction_calibrations',
+                columns=(
+                    'fixture_id,attempt_number,status,retry_after,'
+                    'base_prediction_updated_at'
+                ),
+                in_values={
+                    'fixture_id': fixture_ids[
+                        index:index + POSTGREST_IN_FILTER_CHUNK_SIZE
+                    ]
+                },
+            ))
+        latest: dict[int, dict[str, Any]] = {}
+        for row in attempts:
+            fixture_id = int(row['fixture_id'])
+            if (
+                fixture_id not in latest
+                or int(row['attempt_number'])
+                > int(latest[fixture_id]['attempt_number'])
+            ):
+                latest[fixture_id] = row
+        now = datetime.now(timezone.utc)
+
+        def retry_due(row: Mapping[str, Any]) -> bool:
+            value = row.get('retry_after')
+            if not value:
+                return True
+            try:
+                parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+            except (TypeError, ValueError):
+                return True
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc) <= now
+
+        never_calibrated = []
+        refresh_candidates = []
+        for prediction in predictions:
+            fixture_id = int(prediction['fixture_id'])
+            attempt = latest.get(fixture_id)
+            if attempt is None:
+                never_calibrated.append(prediction)
+                continue
+            if str(attempt.get('base_prediction_updated_at')) != str(
+                prediction.get('updated_at')
+            ):
+                refresh_candidates.append(prediction)
+                continue
+            if attempt.get('status') == 'pending' and retry_due(attempt):
+                refresh_candidates.append(prediction)
+        return [
+            *never_calibrated,
+            *refresh_candidates,
+        ][:int(limit)]
 
     async def ensure_legacy_league(self, competition: Mapping[str, Any]) -> None:
         api_league_id = competition.get('api_league_id')
