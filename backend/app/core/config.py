@@ -79,6 +79,16 @@ class Settings(BaseSettings):
     postmatch_lookback_days: int = Field(default=7, ge=1, le=30)
     postmatch_max_matches: int = Field(default=100, ge=1, le=100)
     postmatch_poll_interval_minutes: int = Field(default=30, ge=10, le=120)
+    retention_enabled: bool = True
+    retention_dry_run: bool = False
+    retention_raw_payload_days: int = Field(default=1825, ge=365, le=3650)
+    retention_api_log_days: int = Field(default=90, ge=7, le=3650)
+    retention_fixture_batch_size: int = Field(default=500, ge=1, le=2000)
+    retention_api_log_batch_size: int = Field(default=5000, ge=1, le=10000)
+    retention_max_batches: int = Field(default=10, ge=1, le=50)
+    retention_weekday: int = Field(default=6, ge=0, le=6)
+    retention_hour: int = Field(default=3, ge=0, le=23)
+    retention_minute: int = Field(default=30, ge=0, le=59)
     scheduler_daily_hour: int = Field(default=0, ge=0, le=23)
     scheduler_daily_minute: int = Field(default=5, ge=0, le=59)
     default_timezone: str = 'America/Lima'

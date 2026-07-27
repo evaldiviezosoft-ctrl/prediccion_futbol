@@ -45,11 +45,59 @@ void main() {
 
     expect(
       fixtures.single.homeTeamLogoUrl,
-      'http://10.0.2.2:8000/fixtures/team-logo/132',
+      'https://api-production-1d96.up.railway.app/fixtures/team-logo/132',
     );
     expect(
       fixtures.single.awayTeamLogoUrl,
-      'http://10.0.2.2:8000/fixtures/team-logo/127',
+      'https://api-production-1d96.up.railway.app/fixtures/team-logo/127',
+    );
+    repository.dispose();
+  });
+
+  test(
+    'health tolera un arranque en frío dentro del margen configurado',
+    () async {
+      final client = MockClient((_) async {
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        return http.Response(
+          jsonEncode({
+            'status': 'ready',
+            'checks': {'database': true, 'models': true},
+          }),
+          200,
+        );
+      });
+      final repository = FootballRepository(
+        client: client,
+        healthTimeout: const Duration(milliseconds: 100),
+      );
+
+      final health = await repository.checkHealth();
+
+      expect(health.ready, isTrue);
+      repository.dispose();
+    },
+  );
+
+  test('health clasifica correctamente un timeout real', () async {
+    final client = MockClient((_) async {
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+      return http.Response(jsonEncode({'status': 'ready'}), 200);
+    });
+    final repository = FootballRepository(
+      client: client,
+      healthTimeout: const Duration(milliseconds: 5),
+    );
+
+    await expectLater(
+      repository.checkHealth(),
+      throwsA(
+        isA<FootballRepositoryException>().having(
+          (error) => error.kind,
+          'kind',
+          RepositoryErrorKind.timeout,
+        ),
+      ),
     );
     repository.dispose();
   });

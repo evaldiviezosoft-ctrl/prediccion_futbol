@@ -776,3 +776,45 @@ def test_two_finished_cup_legs_receive_relative_aggregate_scores():
     assert (second_leg['aggregate_home'], second_leg['aggregate_away']) == (4, 3)
     assert first_leg['leg'] == 'first'
     assert second_leg['leg'] == 'second'
+
+
+def test_safe_retention_calls_the_fixed_rpc_with_iso_cutoffs():
+    calls = []
+
+    class Query:
+        def execute(self):
+            return _Response([{
+                'fixture_candidates': 4,
+                'fixtures_compacted': 4,
+                'api_log_candidates': 8,
+                'api_logs_deleted': 8,
+            }])
+
+    class Client:
+        def rpc(self, name, params):
+            calls.append((name, params))
+            return Query()
+
+    repository = SupabaseRepository(client=Client())
+    raw_cutoff = datetime(2021, 7, 28, tzinfo=timezone.utc)
+    log_cutoff = datetime(2026, 4, 28, tzinfo=timezone.utc)
+
+    result = asyncio.run(repository.run_safe_data_retention(
+        raw_cutoff=raw_cutoff,
+        api_log_cutoff=log_cutoff,
+        max_fixtures=500,
+        max_api_logs=5000,
+        dry_run=False,
+    ))
+
+    assert result['fixtures_compacted'] == 4
+    assert calls == [(
+        'run_safe_data_retention',
+        {
+            'p_raw_cutoff': '2021-07-28T00:00:00+00:00',
+            'p_api_log_cutoff': '2026-04-28T00:00:00+00:00',
+            'p_max_fixtures': 500,
+            'p_max_api_logs': 5000,
+            'p_dry_run': False,
+        },
+    )]

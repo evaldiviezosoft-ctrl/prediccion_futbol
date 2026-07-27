@@ -30,25 +30,25 @@ class FootballRepositoryException implements Exception {
 class FootballRepository implements FootballDataSource {
   FootballRepository({
     http.Client? client,
+    Duration healthTimeout = const Duration(seconds: 20),
     Duration pollInterval = const Duration(seconds: 15),
     Duration retryBaseDelay = const Duration(seconds: 2),
     int maxTransientFailures = 3,
   }) : _client = client ?? http.Client(),
+       _healthTimeout = healthTimeout,
        _pollInterval = pollInterval,
        _retryBaseDelay = retryBaseDelay,
        _maxTransientFailures = maxTransientFailures;
 
   final http.Client _client;
+  final Duration _healthTimeout;
   final Duration _pollInterval;
   final Duration _retryBaseDelay;
   final int _maxTransientFailures;
 
   @override
   Future<BackendHealth> checkHealth() async {
-    final response = await _get(
-      '/health/ready',
-      timeout: const Duration(seconds: 6),
-    );
+    final response = await _get('/health/ready', timeout: _healthTimeout);
     try {
       return BackendHealth.fromJson(
         Map<String, dynamic>.from(jsonDecode(response.body) as Map),
