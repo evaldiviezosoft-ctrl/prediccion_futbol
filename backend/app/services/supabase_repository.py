@@ -1637,6 +1637,33 @@ class SupabaseRepository:
             limit=limit,
         )
 
+    async def run_safe_data_retention(
+        self,
+        *,
+        raw_cutoff: datetime,
+        api_log_cutoff: datetime,
+        max_fixtures: int,
+        max_api_logs: int,
+        dry_run: bool,
+    ) -> dict[str, Any]:
+        params = {
+            'p_raw_cutoff': raw_cutoff.isoformat(),
+            'p_api_log_cutoff': api_log_cutoff.isoformat(),
+            'p_max_fixtures': max_fixtures,
+            'p_max_api_logs': max_api_logs,
+            'p_dry_run': dry_run,
+        }
+
+        def execute() -> list[dict[str, Any]]:
+            return _response_rows(
+                self._client.rpc('run_safe_data_retention', params).execute()
+            )
+
+        rows = await asyncio.to_thread(execute)
+        if not rows:
+            raise RuntimeError('The data-retention function returned no result.')
+        return rows[0]
+
     async def latest_api_rate_limit(self) -> dict[str, Any] | None:
         rows = await self._select(
             'api_request_logs',

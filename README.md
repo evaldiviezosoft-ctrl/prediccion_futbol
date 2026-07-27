@@ -90,8 +90,10 @@ Los archivos preparados son:
 
 Solo contienen `BACKEND_URL`; Flutter ya no abre una conexión directa a
 Supabase. `SUPABASE_SECRET_KEY` permanece exclusivamente en `backend/.env`.
-El valor predeterminado `http://10.0.2.2:8000` permite usar el botón **Run** en
-el emulador Android cuando FastAPI está activo.
+El valor predeterminado apunta al backend HTTPS de Railway, por lo que el botón
+**Run** también funciona en un teléfono físico. Para trabajar contra FastAPI
+local desde el emulador Android se debe seleccionar explícitamente
+`config/dev.android.json`.
 
 Web:
 
@@ -107,8 +109,8 @@ cd prediccion_futbol
 flutter run --dart-define-from-file=config/dev.android.json
 ```
 
-Para un teléfono físico, reemplaza `10.0.2.2` por la IP local del equipo que
-ejecuta FastAPI. En producción, `BACKEND_URL` debe usar HTTPS.
+Para conectar un teléfono físico a FastAPI local, crea una configuración local
+con la IP LAN del equipo. `10.0.2.2` solo existe dentro del emulador Android.
 
 APK de producción:
 
@@ -156,6 +158,16 @@ SCHEDULER_PREDICTION_HORIZON_DAYS=14
 POSTMATCH_LOOKBACK_DAYS=7
 POSTMATCH_MAX_MATCHES=100
 POSTMATCH_POLL_INTERVAL_MINUTES=30
+RETENTION_ENABLED=true
+RETENTION_DRY_RUN=false
+RETENTION_RAW_PAYLOAD_DAYS=1825
+RETENTION_API_LOG_DAYS=90
+RETENTION_FIXTURE_BATCH_SIZE=500
+RETENTION_API_LOG_BATCH_SIZE=5000
+RETENTION_MAX_BATCHES=10
+RETENTION_WEEKDAY=6
+RETENTION_HOUR=3
+RETENTION_MINUTE=30
 SCHEDULER_DAILY_HOUR=0
 SCHEDULER_DAILY_MINUTE=5
 DEFAULT_TIMEZONE=America/Lima
@@ -176,6 +188,20 @@ cuota gratuita.
 predicciones desde partidos ya guardados; esta segunda fase no consume cuota
 del proveedor y procesa hasta 100 partidos por ciclo.
 
+El plan Free de API-Football permite consultar fechas futuras; la app móvil no
+consulta directamente al proveedor y su botón **Actualizar** solo vuelve a leer
+Supabase. Si se cambia la clave o se despliega después de las `00:05`, el
+scheduler no recupera automáticamente esa ejecución perdida. Se puede llenar
+el calendario de los dos días siguientes y publicar sus predicciones con dos
+consultas de calendario:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri 'https://api-production-1d96.up.railway.app/admin/jobs/sync-and-predict?horizon_days=2&max_matches=25' `
+  -Headers @{ 'X-Admin-Token' = $env:FOOTBALL_ADMIN_TOKEN }
+```
+
 `POSTMATCH_LOOKBACK_DAYS` y `POSTMATCH_MAX_MATCHES` controlan el cierre de
 resultados. Esta fase revisa como máximo 100 partidos ya pronosticados,
 actualiza primero el marcador mediante el calendario de la fecha UTC vigente e
@@ -185,6 +211,19 @@ día UTC para proteger la cuota.
 Si el plan de API-Football bloquea córners, tarjetas o remates, esos mercados
 quedan `pending`: los goles sí se califican con el marcador y una estadística
 ausente nunca se registra como fallo.
+
+La retención se ejecuta los domingos a las `03:30` de Lima. No borra partidos,
+estadísticas normalizadas, snapshots de pronósticos ni evaluaciones. En lotes
+acotados elimina logs técnicos de API con más de 90 días y vacía únicamente
+los dos JSON idénticos de fixtures finalizados con más de cinco años. Se puede
+previsualizar sin cambiar datos:
+
+```powershell
+Invoke-RestMethod `
+  -Method Post `
+  -Uri 'https://api-production-1d96.up.railway.app/admin/jobs/data-retention?dry_run=true' `
+  -Headers @{ 'X-Admin-Token' = $env:FOOTBALL_ADMIN_TOKEN }
+```
 
 El programador vive dentro del proceso FastAPI: si el equipo o servidor está
 apagado, no puede sincronizar. En un despliegue con varias réplicas se debe

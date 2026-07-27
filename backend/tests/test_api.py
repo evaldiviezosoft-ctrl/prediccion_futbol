@@ -556,6 +556,33 @@ def test_admin_postmatch_defaults_to_one_hundred_and_rejects_more(monkeypatch):
     mocked_job.assert_awaited_once_with(lookback_days=7, max_matches=100)
 
 
+def test_admin_retention_is_protected_and_defaults_to_dry_run(monkeypatch):
+    monkeypatch.setattr(dependencies, 'get_settings', lambda: settings_with_admin())
+    mocked_job = AsyncMock(
+        return_value={
+            'dry_run': True,
+            'fixture_candidates': 0,
+            'api_log_candidates': 0,
+        }
+    )
+    monkeypatch.setattr(admin, 'run_safe_data_retention', mocked_job)
+
+    with TestClient(app) as client:
+        wrong = client.post(
+            '/admin/jobs/data-retention?dry_run=false',
+            headers={'X-Admin-Token': 'wrong_admin_token_0123456789'},
+        )
+        preview = client.post(
+            '/admin/jobs/data-retention',
+            headers={'X-Admin-Token': VALID_ADMIN_TOKEN},
+        )
+
+    assert wrong.status_code == 401
+    assert preview.status_code == 200
+    assert preview.json()['dry_run'] is True
+    mocked_job.assert_awaited_once_with(dry_run=True)
+
+
 def test_provider_errors_are_mapped_without_exposing_internal_details(monkeypatch):
     monkeypatch.setattr(dependencies, 'get_settings', lambda: settings_with_admin())
     monkeypatch.setattr(

@@ -56,6 +56,16 @@ def _configured_settings(**overrides):
         'postmatch_lookback_days': 7,
         'postmatch_max_matches': 100,
         'postmatch_poll_interval_minutes': 30,
+        'retention_enabled': True,
+        'retention_dry_run': False,
+        'retention_raw_payload_days': 1825,
+        'retention_api_log_days': 90,
+        'retention_fixture_batch_size': 500,
+        'retention_api_log_batch_size': 5000,
+        'retention_max_batches': 10,
+        'retention_weekday': 6,
+        'retention_hour': 3,
+        'retention_minute': 30,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -74,7 +84,7 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
     assert scheduler is not None
     assert scheduler.running is True
     assert scheduler.timezone == ZoneInfo('America/Lima')
-    assert len(scheduler.jobs) == 3
+    assert len(scheduler.jobs) == 4
     function, job_options = scheduler.jobs[0]
     assert function is scheduler_service._scheduled_cycle
     assert job_options['id'] == 'sync-and-predict'
@@ -108,6 +118,20 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
     immediate_postmatch_run = postmatch_options['next_run_time']
     assert isinstance(immediate_postmatch_run, datetime)
     assert immediate_postmatch_run.tzinfo == ZoneInfo('America/Lima')
+    retention_function, retention_options = scheduler.jobs[3]
+    assert retention_function is scheduler_service._scheduled_retention_cycle
+    assert retention_options['id'] == 'safe-data-retention'
+    assert retention_options['coalesce'] is True
+    assert retention_options['max_instances'] == 1
+    assert retention_options['misfire_grace_time'] == 3600
+    assert 'next_run_time' not in retention_options
+    next_retention_run = retention_options['trigger'].get_next_fire_time(
+        None,
+        datetime(2026, 7, 27, 4, 0, tzinfo=ZoneInfo('America/Lima')),
+    )
+    assert next_retention_run == datetime(
+        2026, 8, 2, 3, 30, tzinfo=ZoneInfo('America/Lima')
+    )
 
 
 def test_daily_scheduler_waits_for_cron_by_default(monkeypatch):
@@ -290,6 +314,46 @@ def test_scheduled_postmatch_cycle_contains_failure_details(monkeypatch, caplog)
     assert 'private provider details' not in caplog.text
 
 
+def test_scheduled_retention_cycle_logs_only_bounded_summary(monkeypatch, caplog):
+    async def fake_retention():
+        return {
+            'dry_run': False,
+            'batches': 2,
+            'fixtures_compacted': 15,
+            'api_logs_deleted': 250,
+            'batch_limit_reached': False,
+        }
+
+    monkeypatch.setattr(
+        scheduler_service,
+        'run_safe_data_retention',
+        fake_retention,
+    )
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_retention_cycle())
+
+    assert 'fixtures_compacted=15 api_logs_deleted=250' in caplog.text
+
+
+def test_scheduler_can_disable_only_the_retention_job(monkeypatch):
+    monkeypatch.setattr(scheduler_service, 'AsyncIOScheduler', FakeAsyncIOScheduler)
+    monkeypatch.setattr(
+        scheduler_service,
+        'get_settings',
+        lambda: _configured_settings(retention_enabled=False),
+    )
+
+    scheduler = scheduler_service.start_scheduler()
+
+    assert scheduler is not None
+    assert [options['id'] for _, options in scheduler.jobs] == [
+        'sync-and-predict',
+        'sync-confirmed-lineups',
+        'evaluate-postmatch-results',
+    ]
+
+
 def test_lineup_cycle_filters_to_predictions_and_downloads_only_confirmed_window(
     monkeypatch,
 ):
@@ -404,6 +468,24 @@ def test_postmatch_poll_interval_rejects_invalid_values(invalid_value):
             _env_file=None,
             postmatch_poll_interval_minutes=invalid_value,
         )
+
+
+@pytest.mark.parametrize(
+    ('field_name', 'invalid_value'),
+    (
+        ('retention_raw_payload_days', 364),
+        ('retention_api_log_days', 6),
+        ('retention_fixture_batch_size', 2001),
+        ('retention_api_log_batch_size', 10001),
+        ('retention_max_batches', 51),
+        ('retention_weekday', 7),
+        ('retention_hour', 24),
+        ('retention_minute', 60),
+    ),
+)
+def test_retention_settings_reject_unsafe_values(field_name, invalid_value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field_name: invalid_value})
 
 
 def test_scheduler_does_not_start_with_invalid_timezone(monkeypatch):

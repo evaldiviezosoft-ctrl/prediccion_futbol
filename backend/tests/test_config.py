@@ -47,3 +47,20 @@ def test_postmatch_evaluation_defaults_are_bounded():
     assert settings.postmatch_lookback_days == 7
     assert settings.postmatch_max_matches == 100
     assert settings.postmatch_poll_interval_minutes == 30
+
+
+def test_safe_retention_defaults_preserve_five_years_and_run_weekly():
+    settings = Settings(_env_file=None)
+
+    assert settings.retention_enabled is True
+    assert settings.retention_dry_run is False
+    assert settings.retention_raw_payload_days == 1825
+    assert settings.retention_api_log_days == 90
+    assert settings.retention_fixture_batch_size == 500
+    assert settings.retention_api_log_batch_size == 5000
+    assert settings.retention_max_batches == 10
+    assert (settings.retention_weekday, settings.retention_hour, settings.retention_minute) == (
+        6,
+        3,
+        30,
+    )

@@ -11,6 +11,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.core.config import get_settings
 from app.db.supabase_client import get_supabase
 from app.services.api_football_client import ApiFootballClient
+from app.services.data_retention_service import run_safe_data_retention
 from app.services.job_service import predict_stored_baselines, sync_and_predict
 from app.services.optional_fixture_sync_service import (
     LINEUPS_EARLIEST_WINDOW,
@@ -134,6 +135,27 @@ async def _scheduled_lineup_cycle() -> None:
     )
 
 
+async def _scheduled_retention_cycle() -> None:
+    """Bound storage without deleting normalized training or audit history."""
+
+    try:
+        result = await run_safe_data_retention()
+        logger.info(
+            'Scheduled data retention completed: dry_run=%s batches=%s '
+            'fixtures_compacted=%s api_logs_deleted=%s batch_limit_reached=%s',
+            result['dry_run'],
+            result['batches'],
+            result['fixtures_compacted'],
+            result['api_logs_deleted'],
+            result['batch_limit_reached'],
+        )
+    except Exception as exc:
+        logger.error(
+            'Scheduled data retention failed: %s',
+            type(exc).__name__,
+        )
+
+
 def start_scheduler() -> AsyncIOScheduler | None:
     global _scheduler
     settings = get_settings()
@@ -193,15 +215,31 @@ def start_scheduler() -> AsyncIOScheduler | None:
         max_instances=1,
         next_run_time=datetime.now(local_timezone),
     )
+    if settings.retention_enabled:
+        scheduler.add_job(
+            _scheduled_retention_cycle,
+            trigger=CronTrigger(
+                day_of_week=settings.retention_weekday,
+                hour=settings.retention_hour,
+                minute=settings.retention_minute,
+                timezone=local_timezone,
+            ),
+            id='safe-data-retention',
+            replace_existing=True,
+            coalesce=True,
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
     scheduler.start()
     _scheduler = scheduler
     logger.info(
         'Prediction scheduler started: daily at %02d:%02d %s; '
-        'post-match every %d minutes; run_on_startup=%s.',
+        'post-match every %d minutes; retention_enabled=%s; run_on_startup=%s.',
         settings.scheduler_daily_hour,
         settings.scheduler_daily_minute,
         settings.default_timezone,
         settings.postmatch_poll_interval_minutes,
+        settings.retention_enabled,
         settings.scheduler_run_on_startup,
     )
     return scheduler

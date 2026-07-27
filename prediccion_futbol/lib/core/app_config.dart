@@ -5,7 +5,7 @@ class AppConfig {
 
   static const backendUrl = String.fromEnvironment(
     'BACKEND_URL',
-    defaultValue: 'http://10.0.2.2:8000',
+    defaultValue: 'https://api-production-1d96.up.railway.app',
   );
 
   static String get normalizedBackendUrl => backendUrl.endsWith('/')
