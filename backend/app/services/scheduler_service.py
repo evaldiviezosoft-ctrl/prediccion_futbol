@@ -10,16 +10,15 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.core.config import get_settings
 from app.db.supabase_client import get_supabase
-from app.services.ai_calibration_service import (
-    calibrate_stored_predictions,
-    refresh_ai_calibration,
-)
 from app.services.api_football_client import ApiFootballClient
 from app.services.job_service import predict_stored_baselines, sync_and_predict
 from app.services.optional_fixture_sync_service import (
     LINEUPS_EARLIEST_WINDOW,
     OptionalFixtureSyncOptions,
     OptionalFixtureSyncService,
+)
+from app.services.prediction_evaluation_service import (
+    sync_and_evaluate_published_predictions,
 )
 from app.services.supabase_repository import SupabaseRepository
 
@@ -64,32 +63,29 @@ async def _scheduled_cycle() -> None:
             type(exc).__name__,
         )
 
+
+async def _scheduled_postmatch_cycle() -> None:
+    """Refresh finished fixtures and settle their stored prediction snapshot."""
+
     try:
         settings = get_settings()
-        if getattr(settings, 'openai_configured', False):
-            calibrated = await calibrate_stored_predictions(
-                horizon_days=getattr(
-                    settings,
-                    'ai_calibration_horizon_days',
-                    settings.scheduler_prediction_horizon_days,
-                ),
-                max_matches=getattr(
-                    settings,
-                    'ai_calibration_max_per_cycle',
-                    10,
-                ),
-                settings=settings,
-            )
-            logger.info(
-                'Scheduled AI calibration completed: attempted=%s '
-                'updated=%s failed=%s',
-                calibrated['attempted'],
-                calibrated['updated'],
-                calibrated['failed'],
-            )
+        evaluated = await sync_and_evaluate_published_predictions(
+            lookback_days=settings.postmatch_lookback_days,
+            max_matches=settings.postmatch_max_matches,
+        )
+        logger.info(
+            'Scheduled post-match evaluation completed: candidates=%s '
+            'refreshed=%s evaluated=%s partial=%s void=%s legacy=%s',
+            evaluated['candidates'],
+            evaluated['details_refreshed'],
+            evaluated['evaluated'],
+            evaluated['partial'],
+            evaluated['void'],
+            evaluated['legacy_unscored'],
+        )
     except Exception as exc:
         logger.error(
-            'Scheduled AI calibration failed: %s',
+            'Scheduled post-match evaluation failed: %s',
             type(exc).__name__,
         )
 
@@ -136,23 +132,6 @@ async def _scheduled_lineup_cycle() -> None:
         len(result.confirmed_fixture_ids),
         result.skipped,
     )
-    if not getattr(settings, 'openai_configured', False):
-        return
-
-    for fixture_id in result.confirmed_fixture_ids:
-        try:
-            await refresh_ai_calibration(
-                fixture_id,
-                repository=repository,
-                db_client=database,
-                settings=settings,
-            )
-        except Exception as exc:
-            logger.error(
-                'Final lineup calibration failed for fixture %s: %s',
-                fixture_id,
-                type(exc).__name__,
-            )
 
 
 def start_scheduler() -> AsyncIOScheduler | None:
@@ -202,13 +181,27 @@ def start_scheduler() -> AsyncIOScheduler | None:
         coalesce=True,
         max_instances=1,
     )
+    scheduler.add_job(
+        _scheduled_postmatch_cycle,
+        trigger=IntervalTrigger(
+            minutes=settings.postmatch_poll_interval_minutes,
+            timezone=local_timezone,
+        ),
+        id='evaluate-postmatch-results',
+        replace_existing=True,
+        coalesce=True,
+        max_instances=1,
+        next_run_time=datetime.now(local_timezone),
+    )
     scheduler.start()
     _scheduler = scheduler
     logger.info(
-        'Prediction scheduler started: daily at %02d:%02d %s; run_on_startup=%s.',
+        'Prediction scheduler started: daily at %02d:%02d %s; '
+        'post-match every %d minutes; run_on_startup=%s.',
         settings.scheduler_daily_hour,
         settings.scheduler_daily_minute,
         settings.default_timezone,
+        settings.postmatch_poll_interval_minutes,
         settings.scheduler_run_on_startup,
     )
     return scheduler

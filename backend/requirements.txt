@@ -13,4 +13,3 @@ scikit-learn==1.8.0
 joblib>=1.4,<2.0
 apscheduler>=3.11,<4.0
 tzdata>=2025.2,<2027
-openai==2.48.0

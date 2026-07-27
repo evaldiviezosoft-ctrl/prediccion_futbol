@@ -85,22 +85,16 @@ void main() {
     expect(find.text('58%'), findsAtLeastNWidgets(1));
     expect(find.text('24%'), findsAtLeastNWidgets(1));
     expect(find.text('18%'), findsAtLeastNWidgets(1));
-    await tester.scrollUntilVisible(find.text('Pronóstico probable'), 300);
-    expect(
-      find.byKey(const ValueKey('probable-forecast-card')),
-      findsOneWidget,
+    await tester.scrollUntilVisible(
+      find.byKey(const ValueKey('market-goals')),
+      300,
     );
-    expect(find.text('Más de 1.5'), findsOneWidget);
-    expect(find.text('Riesgos'), findsNothing);
-    expect(find.text('Datos faltantes'), findsNothing);
-
-    await tester.scrollUntilVisible(find.text('Más de 0.5 goles'), 300);
     expect(find.text('Goles totales'), findsAtLeastNWidgets(1));
-    expect(find.text('Más de 0.5 goles'), findsOneWidget);
-    expect(find.text('Más de 1.5 goles'), findsOneWidget);
-    expect(find.text('Más de 2.5 goles'), findsOneWidget);
-    expect(find.text('Más de 3.5 goles'), findsOneWidget);
-    expect(find.text('Más de 4.5 goles'), findsOneWidget);
+    expect(find.text('Más de 0.5'), findsOneWidget);
+    expect(find.text('Más de 1.5'), findsOneWidget);
+    expect(find.text('Línea 2.5'), findsOneWidget);
+    expect(find.text('Menos de 3.5'), findsOneWidget);
+    expect(find.text('Menos de 4.5'), findsOneWidget);
 
     await tester.scrollUntilVisible(find.text('Estadísticas por equipo'), 300);
     expect(find.text('Estadísticas por equipo'), findsOneWidget);
@@ -108,6 +102,9 @@ void main() {
     expect(find.text('Córners'), findsAtLeastNWidgets(1));
     expect(find.text('Remates'), findsAtLeastNWidgets(1));
     expect(find.text('Remates al arco'), findsAtLeastNWidgets(1));
+
+    await tester.scrollUntilVisible(find.text('Totales de ambos equipos'), 300);
+    expect(find.byKey(const ValueKey('market-corners')), findsOneWidget);
 
     await tester.scrollUntilVisible(find.text('Goleadores probables'), 300);
     expect(find.text('Goleadores probables'), findsOneWidget);

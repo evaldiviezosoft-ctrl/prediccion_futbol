@@ -1,15 +1,12 @@
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
-import '../models/ai_calibration.dart';
 import '../models/fixture_summary.dart';
+import '../models/market_forecast.dart';
 import '../models/prediction.dart';
-import '../models/probable_forecast.dart';
 import '../repositories/football_data_source.dart';
 import '../theme/app_theme.dart';
 import '../widgets/team_mark.dart';
-
-part '../widgets/ai_calibration_section.dart';
 
 class PredictionScreen extends StatefulWidget {
   const PredictionScreen({
@@ -27,16 +24,12 @@ class PredictionScreen extends StatefulWidget {
 
 class _PredictionScreenState extends State<PredictionScreen> {
   Stream<Prediction?>? _predictionStream;
-  Stream<AiCalibrationResult>? _aiCalibrationStream;
 
   @override
   void initState() {
     super.initState();
     if (widget.fixture.predictionAccessAvailable) {
       _predictionStream = widget.repository.watchPrediction(widget.fixture.id);
-      _aiCalibrationStream = widget.repository.watchAiCalibration(
-        widget.fixture.id,
-      );
     }
   }
 
@@ -44,19 +37,7 @@ class _PredictionScreenState extends State<PredictionScreen> {
     if (!widget.fixture.predictionAccessAvailable) return;
     setState(() {
       _predictionStream = widget.repository.watchPrediction(widget.fixture.id);
-      _aiCalibrationStream = widget.repository.watchAiCalibration(
-        widget.fixture.id,
-      );
     });
-  }
-
-  void _retryAiCalibration() {
-    if (!widget.fixture.predictionAccessAvailable) return;
-    setState(
-      () => _aiCalibrationStream = widget.repository.watchAiCalibration(
-        widget.fixture.id,
-      ),
-    );
   }
 
   @override
@@ -108,8 +89,6 @@ class _PredictionScreenState extends State<PredictionScreen> {
                     return _PredictionContent(
                       fixture: widget.fixture,
                       prediction: prediction,
-                      aiCalibrationStream: _aiCalibrationStream!,
-                      onRetryAiCalibration: _retryAiCalibration,
                     );
                   },
                 ),
@@ -120,17 +99,10 @@ class _PredictionScreenState extends State<PredictionScreen> {
 }
 
 class _PredictionContent extends StatelessWidget {
-  const _PredictionContent({
-    required this.fixture,
-    required this.prediction,
-    required this.aiCalibrationStream,
-    required this.onRetryAiCalibration,
-  });
+  const _PredictionContent({required this.fixture, required this.prediction});
 
   final FixtureSummary fixture;
   final Prediction prediction;
-  final Stream<AiCalibrationResult> aiCalibrationStream;
-  final VoidCallback onRetryAiCalibration;
 
   @override
   Widget build(BuildContext context) {
@@ -152,8 +124,25 @@ class _PredictionContent extends StatelessWidget {
         prediction.isLowConfidenceFallback;
     final isSingleTeamFallback =
         isLowConfidenceFallback && prediction.isSingleTeamProfileFallback;
+    final goalsMarket = isSingleTeamFallback
+        ? null
+        : prediction.marketForecast?.marketFor('goals');
+    final marketForecast = prediction.marketForecast;
+    const combinedMarketOrder = [
+      'corners',
+      'shots',
+      'yellow_cards',
+      'shots_on_target',
+    ];
+    final combinedMarkets = isSingleTeamFallback || marketForecast == null
+        ? const <MarketForecastMarket>[]
+        : combinedMarketOrder
+              .map(marketForecast.marketFor)
+              .whereType<MarketForecastMarket>()
+              .toList(growable: false);
 
     return ListView(
+      key: PageStorageKey<String>('prediction-${fixture.id}'),
       padding: const EdgeInsets.only(bottom: 32),
       children: [
         _MatchHeader(
@@ -171,12 +160,13 @@ class _PredictionContent extends StatelessWidget {
             title: 'Predicción 1X2 (probabilidad)',
             child: _ProbabilityPanel(prediction: prediction),
           ),
-        _AiCalibrationSlot(
-          stream: aiCalibrationStream,
-          baseForecast: prediction.probableForecast,
-          onRetry: onRetryAiCalibration,
-        ),
-        if (prediction.goalLines.isNotEmpty)
+        if (goalsMarket != null && goalsMarket.lines.isNotEmpty)
+          _Section(
+            icon: Icons.sports_soccer,
+            title: 'Goles totales',
+            child: _MarketLinesPanel(market: goalsMarket, showHeader: false),
+          )
+        else if (!isSingleTeamFallback && prediction.goalLines.isNotEmpty)
           _Section(
             icon: Icons.sports_soccer,
             title: 'Goles totales',
@@ -255,6 +245,12 @@ class _PredictionContent extends StatelessWidget {
                 ],
               ],
             ),
+          ),
+        if (combinedMarkets.isNotEmpty)
+          _Section(
+            icon: Icons.query_stats_rounded,
+            title: 'Totales de ambos equipos',
+            child: _CombinedMarketsPanel(markets: combinedMarkets),
           ),
         if (prediction.possibleScorers.isNotEmpty)
           _Section(
@@ -366,12 +362,17 @@ class _MatchHeader extends StatelessWidget {
             children: [
               const Icon(Icons.sports_soccer, color: AppColors.muted, size: 19),
               const SizedBox(width: 8),
-              Text(
-                fixture.leagueName,
-                style: const TextStyle(
-                  color: AppColors.text,
-                  fontSize: 17,
-                  fontWeight: FontWeight.w800,
+              Flexible(
+                child: Text(
+                  fixture.leagueName,
+                  textAlign: TextAlign.center,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: AppColors.text,
+                    fontSize: 17,
+                    fontWeight: FontWeight.w800,
+                  ),
                 ),
               ),
             ],
@@ -704,6 +705,235 @@ class _TeamColumnsHeader extends StatelessWidget {
                 fontSize: 12,
                 fontWeight: FontWeight.w700,
               ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _CombinedMarketsPanel extends StatelessWidget {
+  const _CombinedMarketsPanel({required this.markets});
+
+  final List<MarketForecastMarket> markets;
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Suma estimada de los dos equipos y dirección sugerida para cada '
+          'línea.',
+          style: TextStyle(color: AppColors.muted, fontSize: 13, height: 1.4),
+        ),
+        const SizedBox(height: 14),
+        for (var index = 0; index < markets.length; index++) ...[
+          _MarketLinesPanel(market: markets[index]),
+          if (index != markets.length - 1) const SizedBox(height: 14),
+        ],
+      ],
+    );
+  }
+}
+
+class _MarketLinesPanel extends StatelessWidget {
+  const _MarketLinesPanel({required this.market, this.showHeader = true});
+
+  final MarketForecastMarket market;
+  final bool showHeader;
+
+  @override
+  Widget build(BuildContext context) {
+    final content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (showHeader)
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 36,
+                height: 36,
+                decoration: BoxDecoration(
+                  color: AppColors.primary.withValues(alpha: .12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Icon(
+                  _marketIcon(market.category),
+                  color: AppColors.primary,
+                  size: 20,
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      market.title,
+                      style: const TextStyle(
+                        color: AppColors.text,
+                        fontSize: 16,
+                        fontWeight: FontWeight.w800,
+                      ),
+                    ),
+                    const SizedBox(height: 3),
+                    Text(
+                      'Total esperado ${_marketNumber(market.expectedTotal)}',
+                      style: const TextStyle(
+                        color: AppColors.muted,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              _ConfidenceBadge(confidence: market.confidence),
+            ],
+          )
+        else
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  'Total esperado ${_marketNumber(market.expectedTotal)}',
+                  style: const TextStyle(color: AppColors.muted, fontSize: 13),
+                ),
+              ),
+              _ConfidenceBadge(confidence: market.confidence),
+            ],
+          ),
+        const SizedBox(height: 10),
+        for (final line in market.lines.take(5))
+          _MarketLineRow(category: market.category, value: line),
+      ],
+    );
+
+    if (!showHeader) {
+      return KeyedSubtree(
+        key: ValueKey<String>('market-${market.category}'),
+        child: content,
+      );
+    }
+    return Container(
+      key: ValueKey<String>('market-${market.category}'),
+      padding: const EdgeInsets.fromLTRB(14, 14, 14, 8),
+      decoration: BoxDecoration(
+        color: AppColors.surface,
+        border: Border.all(color: AppColors.border),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: content,
+    );
+  }
+}
+
+class _ConfidenceBadge extends StatelessWidget {
+  const _ConfidenceBadge({required this.confidence});
+
+  final String confidence;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = confidence == 'high'
+        ? AppColors.primary
+        : confidence == 'medium'
+        ? AppColors.blue
+        : AppColors.amber;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: .11),
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        _confidenceLabel(confidence),
+        style: TextStyle(
+          color: color,
+          fontSize: 9,
+          fontWeight: FontWeight.w800,
+          letterSpacing: .2,
+        ),
+      ),
+    );
+  }
+}
+
+class _MarketLineRow extends StatelessWidget {
+  const _MarketLineRow({required this.category, required this.value});
+
+  final String category;
+  final MarketForecastLine value;
+
+  @override
+  Widget build(BuildContext context) {
+    final hasRecommendation = value.hasRecommendation;
+    final color = switch (value.selection) {
+      MarketLineSelection.over => AppColors.primary,
+      MarketLineSelection.under => AppColors.blue,
+      MarketLineSelection.none => AppColors.muted,
+    };
+    final probability =
+        value.selectionProbability ??
+        (value.overProbability > value.underProbability
+            ? value.overProbability
+            : value.underProbability);
+    final line = value.line.toStringAsFixed(1);
+    final selection = switch (value.selection) {
+      MarketLineSelection.over => 'Más de $line',
+      MarketLineSelection.under => 'Menos de $line',
+      MarketLineSelection.none => 'Línea $line',
+    };
+
+    return Padding(
+      key: ValueKey<String>(
+        'market-line-$category-${value.line.toStringAsFixed(1)}',
+      ),
+      padding: const EdgeInsets.symmetric(vertical: 9),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  selection,
+                  style: const TextStyle(
+                    color: AppColors.text,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ),
+              Text(
+                hasRecommendation
+                    ? _percent(value.selectionProbability!)
+                    : 'Sin señal clara',
+                style: TextStyle(
+                  color: color,
+                  fontSize: hasRecommendation ? 16 : 12,
+                  fontWeight: FontWeight.w900,
+                ),
+              ),
+            ],
+          ),
+          if (!hasRecommendation) ...[
+            const SizedBox(height: 3),
+            Text(
+              'Más ${_percent(value.overProbability)} · '
+              'Menos ${_percent(value.underProbability)}',
+              style: const TextStyle(color: AppColors.muted, fontSize: 11),
+            ),
+          ],
+          const SizedBox(height: 7),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              minHeight: 6,
+              value: probability.clamp(0, 1),
+              color: color,
+              backgroundColor: AppColors.surfaceStrong,
             ),
           ),
         ],
@@ -1156,6 +1386,25 @@ bool _hasCompleteExpectedPair(
     prediction.displayExpectedValue(awayKey) != null;
 
 String _number(double? value) => value == null ? '—' : value.toStringAsFixed(1);
+
+String _marketNumber(double value) => value == value.roundToDouble()
+    ? value.toInt().toString()
+    : value.toStringAsFixed(1);
+
+String _confidenceLabel(String confidence) => switch (confidence) {
+  'high' => 'ALTA',
+  'medium' => 'MEDIA',
+  _ => 'BAJA',
+};
+
+IconData _marketIcon(String category) => switch (category) {
+  'goals' => Icons.sports_soccer_rounded,
+  'corners' => Icons.flag_rounded,
+  'shots' => Icons.gps_fixed_rounded,
+  'yellow_cards' => Icons.style_rounded,
+  'shots_on_target' => Icons.adjust_rounded,
+  _ => Icons.query_stats_rounded,
+};
 
 String _updatedLabel(DateTime updatedAt) {
   final difference = DateTime.now().difference(updatedAt);

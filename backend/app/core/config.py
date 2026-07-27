@@ -1,6 +1,5 @@
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
 from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -71,22 +70,15 @@ class Settings(BaseSettings):
     # Compatibilidad temporal con la clave JWT heredada.
     supabase_service_role_key: SecretStr | None = None
     admin_token: SecretStr | None = None
-    openai_api_key: SecretStr | None = None
-    openai_model: str = 'gpt-5.6-sol'
-    openai_reasoning_effort: Literal[
-        'none', 'low', 'medium', 'high', 'xhigh', 'max'
-    ] = 'high'
-    openai_request_timeout_seconds: float = Field(default=180.0, gt=0, le=600)
-    openai_max_output_tokens: int = Field(default=6_000, ge=2_000, le=32_000)
-    ai_calibration_horizon_days: int = Field(default=14, ge=1, le=30)
-    ai_calibration_max_per_cycle: int = Field(default=5, ge=1, le=25)
-    ai_calibration_min_edge_bps: int = Field(default=200, ge=0, le=2_000)
 
     enable_scheduler: bool = False
     scheduler_run_on_startup: bool = False
     max_matches_per_scheduler_cycle: int = Field(default=5, ge=1, le=25)
     scheduler_horizon_days: int = Field(default=7, ge=1, le=30)
     scheduler_prediction_horizon_days: int = Field(default=14, ge=1, le=30)
+    postmatch_lookback_days: int = Field(default=7, ge=1, le=30)
+    postmatch_max_matches: int = Field(default=100, ge=1, le=100)
+    postmatch_poll_interval_minutes: int = Field(default=30, ge=10, le=120)
     scheduler_daily_hour: int = Field(default=0, ge=0, le=23)
     scheduler_daily_minute: int = Field(default=5, ge=0, le=59)
     default_timezone: str = 'America/Lima'
@@ -123,10 +115,6 @@ class Settings(BaseSettings):
         return _usable_secret(self.admin_token, min_length=16)
 
     @property
-    def openai_api_key_value(self) -> str | None:
-        return _usable_secret(self.openai_api_key, min_length=20)
-
-    @property
     def api_football_configured(self) -> bool:
         return self.api_football_key_value is not None
 
@@ -137,10 +125,6 @@ class Settings(BaseSettings):
     @property
     def admin_configured(self) -> bool:
         return self.admin_token_value is not None
-
-    @property
-    def openai_configured(self) -> bool:
-        return self.openai_api_key_value is not None
 
     def require_api_football_key(self) -> str:
         value = self.api_football_key_value
@@ -158,13 +142,6 @@ class Settings(BaseSettings):
         if value is None:
             raise ConfigurationError('ADMIN_TOKEN is missing or is a placeholder.')
         return value
-
-    def require_openai_api_key(self) -> str:
-        value = self.openai_api_key_value
-        if value is None:
-            raise ConfigurationError('OPENAI_API_KEY is missing or is a placeholder.')
-        return value
-
 
 @lru_cache
 def get_settings() -> Settings:

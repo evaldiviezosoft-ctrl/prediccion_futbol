@@ -107,205 +107,235 @@ def test_select_without_limit_reads_every_postgrest_page():
     assert client.ranges == [(0, 999), (1000, 1999), (2000, 2999)]
 
 
-def test_ai_calibration_candidates_prioritize_never_calibrated_fixtures(
-    monkeypatch,
-):
-    repository = SupabaseRepository(client=object())
-    predictions = [
-        {
-            'fixture_id': 1,
-            'kickoff': '2026-07-26T10:00:00+00:00',
-            'updated_at': '2026-07-25T10:00:00+00:00',
-        },
-        {
-            'fixture_id': 2,
-            'kickoff': '2026-07-26T11:00:00+00:00',
-            'updated_at': '2026-07-25T11:00:00+00:00',
-        },
-    ]
-    attempts = [{
-        'fixture_id': 1,
-        'attempt_number': 1,
-        'status': 'updated',
-        'retry_after': None,
-        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
-        'model': 'gpt-5.6-sol',
-        'reasoning_effort': 'max',
-        'prompt_version': 'football-calibrator-1.1',
-        'schema_version': 'ai-calibration-1.0',
-    }]
-
-    async def select(table, **_kwargs):
-        if table == 'predictions':
-            return predictions
-        if table == 'prediction_calibrations':
-            return attempts
-        raise AssertionError(table)
-
-    monkeypatch.setattr(repository, '_select', select)
-
-    rows = asyncio.run(repository.ai_calibration_candidates(
-        starts_at='2026-07-26T00:00:00+00:00',
-        ends_at='2026-07-27T00:00:00+00:00',
-        limit=1,
-        model='gpt-5.6-sol',
-        reasoning_effort='max',
-        prompt_version='football-calibrator-1.1',
-        schema_version='ai-calibration-1.0',
-        processing_stale_before='2026-07-25T00:00:00+00:00',
-    ))
-
-    assert [row['fixture_id'] for row in rows] == [2]
-
-
-def test_ai_calibration_candidates_recover_only_expired_processing_leases(
+def test_prediction_evaluation_candidates_prioritize_most_recent_unsettled(
     monkeypatch,
 ):
     repository = SupabaseRepository(client=object())
     predictions = [
         {
             'fixture_id': fixture_id,
-            'kickoff': f'2026-07-26T{9 + fixture_id:02d}:00:00+00:00',
-            'updated_at': '2026-07-25T09:00:00+00:00',
+            'kickoff': f'2026-07-{20 + fixture_id:02d}T20:00:00+00:00',
+            'market_forecast': {'version': 'deterministic_lines_v1'},
+            'published': True,
         }
         for fixture_id in range(1, 5)
     ]
-    common = {
-        'attempt_number': 1,
-        'retry_after': None,
-        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
-        'model': 'gpt-5.6-sol',
-        'reasoning_effort': 'high',
-        'prompt_version': 'football-calibrator-2.0',
-        'schema_version': 'ai-calibration-2.0',
-    }
-    attempts = [
+    fixtures = [
         {
-            **common,
-            'fixture_id': 1,
-            'status': 'processing',
-            'started_at': '2026-07-25T10:00:00+00:00',
-        },
-        {
-            **common,
-            'fixture_id': 2,
-            'status': 'processing',
-            'started_at': '2026-07-25T13:00:00+00:00',
-        },
-        {
-            **common,
-            'fixture_id': 3,
-            'status': 'error',
-            'started_at': None,
-        },
-        {
-            **common,
-            'fixture_id': 4,
-            'status': 'unavailable',
-            'started_at': None,
-        },
+            'id': fixture_id,
+            'kickoff': f'2026-07-{20 + fixture_id:02d}T20:00:00+00:00',
+        }
+        # Deliberately unsorted to exercise the repository's final ordering.
+        for fixture_id in (1, 3, 2, 4)
     ]
-    calibration_columns = []
 
     async def select(table, **kwargs):
         if table == 'predictions':
+            assert kwargs['order_by'] == ('kickoff', True)
             return predictions
-        if table == 'prediction_calibrations':
-            calibration_columns.append(kwargs['columns'])
-            return attempts
+        if table == 'prediction_evaluations':
+            return [{'fixture_id': 4, 'status': 'completed'}]
+        if table == 'fixtures':
+            return fixtures
         raise AssertionError(table)
 
     monkeypatch.setattr(repository, '_select', select)
 
-    rows = asyncio.run(repository.ai_calibration_candidates(
-        starts_at='2026-07-26T00:00:00+00:00',
-        ends_at='2026-07-27T00:00:00+00:00',
-        limit=10,
-        model='gpt-5.6-sol',
-        reasoning_effort='high',
-        prompt_version='football-calibrator-2.0',
-        schema_version='ai-calibration-2.0',
-        processing_stale_before='2026-07-25T12:00:00+00:00',
+    rows = asyncio.run(repository.prediction_evaluation_candidates(
+        starts_at=datetime(2026, 7, 20, tzinfo=timezone.utc),
+        ends_at=datetime(2026, 7, 30, tzinfo=timezone.utc),
+        limit=2,
     ))
 
-    assert [row['fixture_id'] for row in rows] == [1]
-    assert calibration_columns and 'started_at' in calibration_columns[0]
+    assert [row['id'] for row in rows] == [3, 2]
 
 
-def test_ai_candidates_refresh_only_on_the_first_confirmed_lineup_transition(
+def test_completed_evaluation_persists_partial_results_then_terminal_summary(
     monkeypatch,
 ):
     repository = SupabaseRepository(client=object())
-    predictions = [
+    summary = {
+        'fixture_id': 101,
+        'prediction_version_id': 'version-1',
+        'status': 'completed',
+    }
+    results = [{'fixture_id': 101, 'market': 'goals', 'outcome': 'won'}]
+    calls = []
+
+    async def upsert(table, rows, *, on_conflict, **_kwargs):
+        calls.append((table, rows, on_conflict))
+        return []
+
+    monkeypatch.setattr(repository, '_upsert', upsert)
+
+    asyncio.run(repository.save_prediction_evaluation(summary, results))
+
+    assert calls == [
+        (
+            'prediction_evaluations',
+            {**summary, 'status': 'partial'},
+            'fixture_id',
+        ),
+        (
+            'prediction_market_results',
+            results,
+            (
+                'prediction_version_id,market,scope,period,line,direction'
+            ),
+        ),
+        ('prediction_evaluations', summary, 'fixture_id'),
+    ]
+
+
+def test_completed_evaluation_stays_partial_when_result_write_fails(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    summary = {'fixture_id': 101, 'status': 'completed'}
+    results = [{'fixture_id': 101, 'market': 'goals', 'outcome': 'won'}]
+    persisted = {'status': None}
+
+    async def upsert(table, rows, *, on_conflict, **_kwargs):
+        if table == 'prediction_market_results':
+            raise RuntimeError('result write failed')
+        persisted['status'] = rows['status']
+        return []
+
+    monkeypatch.setattr(repository, '_upsert', upsert)
+
+    with pytest.raises(RuntimeError, match='result write failed'):
+        asyncio.run(repository.save_prediction_evaluation(summary, results))
+
+    assert persisted['status'] == 'partial'
+
+
+def test_completed_evaluation_stays_partial_when_terminal_write_fails(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    summary = {'fixture_id': 101, 'status': 'completed'}
+    results = [{'fixture_id': 101, 'market': 'goals', 'outcome': 'won'}]
+    persisted = {'status': None, 'results_written': False}
+
+    async def upsert(table, rows, *, on_conflict, **_kwargs):
+        if table == 'prediction_market_results':
+            persisted['results_written'] = True
+            return []
+        if rows['status'] == 'completed':
+            raise RuntimeError('terminal write failed')
+        persisted['status'] = rows['status']
+        return []
+
+    monkeypatch.setattr(repository, '_upsert', upsert)
+
+    with pytest.raises(RuntimeError, match='terminal write failed'):
+        asyncio.run(repository.save_prediction_evaluation(summary, results))
+
+    assert persisted == {'status': 'partial', 'results_written': True}
+
+
+@pytest.mark.parametrize('status', ['void', 'legacy_unscored'])
+def test_terminal_evaluation_without_results_is_written_directly(
+    monkeypatch,
+    status,
+):
+    repository = SupabaseRepository(client=object())
+    summary = {'fixture_id': 101, 'status': status}
+    calls = []
+
+    async def upsert(table, rows, *, on_conflict, **_kwargs):
+        calls.append((table, rows, on_conflict))
+        return []
+
+    monkeypatch.setattr(repository, '_upsert', upsert)
+
+    asyncio.run(repository.save_prediction_evaluation(summary, []))
+
+    assert calls == [
+        ('prediction_evaluations', summary, 'fixture_id'),
+    ]
+
+
+def test_performance_summary_includes_settled_partial_fixture_selections(
+    monkeypatch,
+):
+    repository = SupabaseRepository(client=object())
+    evaluations = [
         {
-            'fixture_id': 1,
-            'kickoff': '2026-07-26T10:00:00+00:00',
-            'updated_at': '2026-07-25T11:00:00+00:00',
-            'lineups_confirmed': False,
+            'fixture_id': 101,
+            'status': 'completed',
+            'scored_selections': 2,
+            'correct_selections': 1,
         },
         {
-            'fixture_id': 2,
-            'kickoff': '2026-07-26T11:00:00+00:00',
-            'updated_at': '2026-07-25T11:00:00+00:00',
-            'lineups_confirmed': True,
+            'fixture_id': 102,
+            'status': 'partial',
+            'scored_selections': 1,
+            'correct_selections': 1,
         },
         {
-            'fixture_id': 3,
-            'kickoff': '2026-07-26T12:00:00+00:00',
-            'updated_at': '2026-07-25T11:00:00+00:00',
-            'lineups_confirmed': True,
+            'fixture_id': 103,
+            'status': 'partial',
+            'scored_selections': 0,
+            'correct_selections': 0,
+        },
+        {
+            'fixture_id': 104,
+            'status': 'legacy_unscored',
+            'scored_selections': 0,
+            'correct_selections': 0,
         },
     ]
-    common = {
-        'attempt_number': 1,
-        'status': 'updated',
-        'retry_after': None,
-        'started_at': None,
-        'base_prediction_updated_at': '2026-07-25T09:00:00+00:00',
-        'model': 'gpt-5.6-sol',
-        'reasoning_effort': 'high',
-        'prompt_version': 'football-calibrator-3.0',
-        'schema_version': 'ai-calibration-3.0',
-    }
-    attempts = [
+    results = [
         {
-            **common,
-            'fixture_id': 1,
-            'analysis': {'lineups_considered': False},
+            'fixture_id': 101,
+            'market': 'goals',
+            'line': 1.5,
+            'direction': 'over',
+            'outcome': 'won',
         },
         {
-            **common,
-            'fixture_id': 2,
-            'analysis': {'lineups_considered': False},
+            'fixture_id': 101,
+            'market': 'goals',
+            'line': 3.5,
+            'direction': 'under',
+            'outcome': 'lost',
         },
         {
-            **common,
-            'fixture_id': 3,
-            'analysis': {'lineups_considered': True},
+            'fixture_id': 102,
+            'market': 'shots',
+            'line': 19.5,
+            'direction': 'over',
+            'outcome': 'won',
         },
     ]
 
-    async def select(table, **_kwargs):
-        if table == 'predictions':
-            return predictions
-        if table == 'prediction_calibrations':
-            return attempts
+    async def select(table, **kwargs):
+        if table == 'prediction_evaluations':
+            return evaluations
+        if table == 'prediction_market_results':
+            assert 'fixture_id' in kwargs['columns']
+            assert kwargs['in_values'] == {'outcome': ('won', 'lost')}
+            return results
         raise AssertionError(table)
 
     monkeypatch.setattr(repository, '_select', select)
 
-    rows = asyncio.run(repository.ai_calibration_candidates(
-        starts_at='2026-07-26T00:00:00+00:00',
-        ends_at='2026-07-27T00:00:00+00:00',
-        limit=10,
-        model='gpt-5.6-sol',
-        reasoning_effort='high',
-        prompt_version='football-calibrator-3.0',
-        schema_version='ai-calibration-3.0',
-        processing_stale_before='2026-07-25T00:00:00+00:00',
-    ))
+    summary = asyncio.run(repository.prediction_performance_summary())
 
-    assert [row['fixture_id'] for row in rows] == [2]
+    assert summary == {
+        'evaluated_fixtures': 2,
+        'completed_fixtures': 1,
+        'partial_fixtures': 2,
+        'legacy_unscored_fixtures': 1,
+        'scored_selections': 3,
+        'correct_selections': 2,
+        'accuracy': 0.6667,
+        'by_market': {
+            'goals': {'scored': 2, 'correct': 1, 'accuracy': 0.5},
+            'shots': {'scored': 1, 'correct': 1, 'accuracy': 1.0},
+        },
+    }
 
 
 class _FilteredQuery:
@@ -581,39 +611,6 @@ def test_targeted_team_history_can_be_restricted_to_the_target_competition():
         {'home_team_id': 69, 'league_id': 71},
         {'away_team_id': 69, 'league_id': 71},
     ]
-
-
-def test_ai_calibration_loads_form_history_and_latest_global_rest_match():
-    repository = SupabaseRepository(client=object())
-    repository.published_prediction = AsyncMock(return_value={
-        'fixture_id': 901,
-        'league_id': 71,
-        'kickoff': '2026-07-28T22:00:00+00:00',
-        'home_team_id': 10,
-        'away_team_id': 20,
-    })
-    repository.prediction_fixture = AsyncMock(return_value={'id': 901})
-    repository.historical_finished_fixtures_for_team = AsyncMock(
-        return_value=[]
-    )
-    repository._select = AsyncMock(return_value=[])
-    repository.optional_sync_status = AsyncMock(return_value={})
-
-    source = asyncio.run(repository.ai_calibration_source_rows(901))
-
-    calls = [
-        item.kwargs
-        for item in (
-            repository.historical_finished_fixtures_for_team.await_args_list
-        )
-    ]
-    assert source['histories'] == {'home': [], 'away': []}
-    assert source['latest_histories'] == {'home': [], 'away': []}
-    assert len(calls) == 4
-    assert [
-        (call.get('league_id'), call['limit'])
-        for call in calls
-    ] == [(71, 12), (None, 1), (71, 12), (None, 1)]
 
 
 def test_mark_sync_component_pending_rejects_unknown_component():

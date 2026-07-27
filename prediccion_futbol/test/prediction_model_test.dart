@@ -41,6 +41,42 @@ void main() {
           'confidence': 'medium',
         },
       ],
+      'market_forecast': {
+        'version': '1.0',
+        'method': 'poisson_empirical',
+        'markets': [
+          {
+            'category': 'goals',
+            'title': 'Goles',
+            'scope': 'match_total',
+            'expected_total': 2.6,
+            'confidence': 'medium',
+            'lines': [
+              {
+                'line': 0.5,
+                'over_probability': 0.92,
+                'under_probability': 0.08,
+                'selection': 'over',
+                'selection_probability': 0.92,
+              },
+              {
+                'line': 2.5,
+                'over_probability': 0.49,
+                'under_probability': 0.51,
+                'selection': 'none',
+                'selection_probability': null,
+              },
+              {
+                'line': 4.5,
+                'over_probability': 0.12,
+                'under_probability': 0.88,
+                'selection': 'under',
+                'selection_probability': 0.88,
+              },
+            ],
+          },
+        ],
+      },
       'updated_at': '2026-07-22T15:00:00Z',
       'model_metadata': {
         'model_type': 'statistical_baseline',
@@ -79,6 +115,15 @@ void main() {
     expect(prediction.possibleAssistants.single.player, 'Arrascaeta');
     expect(prediction.probableForecast.single.category, 'goals');
     expect(prediction.probableForecast.single.prediction, 'Más de 1.5');
+    expect(prediction.marketForecast?.version, '1.0');
+    expect(prediction.marketForecast?.method, 'poisson_empirical');
+    final goalsMarket = prediction.marketForecast?.marketFor('goals');
+    expect(goalsMarket?.expectedTotal, 2.6);
+    expect(goalsMarket?.lines, hasLength(3));
+    expect(goalsMarket?.lines.first.hasRecommendation, isTrue);
+    expect(goalsMarket?.lines[1].hasRecommendation, isFalse);
+    expect(goalsMarket?.lines.last.selection.name, 'under');
+    expect(goalsMarket?.lines.last.selectionProbability, 0.88);
     expect(prediction.usesCrossLeagueStatisticsReference, isTrue);
     expect(prediction.statisticsReferenceRows, 41);
     expect(prediction.statisticsReferenceLeagueId, 281);
@@ -134,6 +179,45 @@ void main() {
         'away_source': {'competition_name': 'Premier League'},
       }),
       isNull,
+    );
+  });
+
+  test('Prediction rechaza una recomendación de mercado incoherente', () {
+    expect(
+      () => Prediction.fromJson({
+        'fixture_id': 1,
+        'home_team_name': 'Local',
+        'away_team_name': 'Visitante',
+        'stage': 'prematch',
+        'home_win_probability': .4,
+        'draw_probability': .3,
+        'away_win_probability': .3,
+        'expected': <String, dynamic>{},
+        'market_forecast': {
+          'version': '1.0',
+          'method': 'poisson_empirical',
+          'markets': [
+            {
+              'category': 'goals',
+              'title': 'Goles',
+              'scope': 'match_total',
+              'expected_total': 2.1,
+              'confidence': 'medium',
+              'lines': [
+                {
+                  'line': 1.5,
+                  'over_probability': .7,
+                  'under_probability': .3,
+                  'selection': 'over',
+                  'selection_probability': null,
+                },
+              ],
+            },
+          ],
+        },
+        'updated_at': '2026-07-23T15:00:00Z',
+      }),
+      throwsFormatException,
     );
   });
 }
