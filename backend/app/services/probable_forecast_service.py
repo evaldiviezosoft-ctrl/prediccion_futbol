@@ -5,7 +5,19 @@ from typing import Any, Mapping
 
 
 MIN_OVER_PROBABILITY = 0.60
+MARKET_RECOMMENDATION_PROBABILITY = 0.65
+MARKET_FORECAST_VERSION = 'deterministic_lines_v1'
+MARKET_FORECAST_METHOD = 'poisson_mean_approximation'
 FRIENDLY_LEAGUE_ID = 667
+GOAL_TOTAL_LINES = (0.5, 1.5, 2.5, 3.5, 4.5)
+MARKET_FORECAST_CATEGORIES = frozenset({
+    'goals',
+    'corners',
+    'yellow_cards',
+    'shots',
+    'shots_on_target',
+})
+MARKET_FORECAST_CONFIDENCE = frozenset({'low', 'medium', 'high'})
 
 
 def _finite_nonnegative(value: Any) -> float | None:
@@ -16,6 +28,87 @@ def _finite_nonnegative(value: Any) -> float | None:
     if not math.isfinite(number) or number < 0:
         return None
     return number
+
+
+def empty_market_forecast() -> dict[str, Any]:
+    return {
+        'version': MARKET_FORECAST_VERSION,
+        'method': MARKET_FORECAST_METHOD,
+        'markets': [],
+    }
+
+
+def validated_market_forecast(value: Any) -> dict[str, Any]:
+    """Return only a complete deterministic snapshot safe for public clients.
+
+    Legacy rows received an empty default during the schema migration. They
+    must stay empty: rebuilding a pick during a read would create advice that
+    was never frozen before kickoff and therefore cannot be audited later.
+    """
+
+    if not isinstance(value, Mapping):
+        return empty_market_forecast()
+    if (
+        value.get('version') != MARKET_FORECAST_VERSION
+        or value.get('method') != MARKET_FORECAST_METHOD
+        or not isinstance(value.get('markets'), list)
+    ):
+        return empty_market_forecast()
+
+    seen_categories: set[str] = set()
+    for market in value['markets']:
+        if not isinstance(market, Mapping):
+            return empty_market_forecast()
+        category = str(market.get('category') or '')
+        expected_total = _finite_nonnegative(market.get('expected_total'))
+        lines = market.get('lines')
+        if (
+            category not in MARKET_FORECAST_CATEGORIES
+            or category in seen_categories
+            or not str(market.get('title') or '').strip()
+            or market.get('scope') != 'match_total'
+            or expected_total is None
+            or market.get('confidence') not in MARKET_FORECAST_CONFIDENCE
+            or not isinstance(lines, list)
+            or len(lines) != 5
+        ):
+            return empty_market_forecast()
+        seen_categories.add(category)
+
+        seen_lines: set[float] = set()
+        for row in lines:
+            if not isinstance(row, Mapping):
+                return empty_market_forecast()
+            line = _finite_nonnegative(row.get('line'))
+            over = _finite_nonnegative(row.get('over_probability'))
+            under = _finite_nonnegative(row.get('under_probability'))
+            selection = str(row.get('selection') or '')
+            selection_probability = row.get('selection_probability')
+            if (
+                line is None
+                or line in seen_lines
+                or over is None
+                or under is None
+                or over > 1
+                or under > 1
+                or abs((over + under) - 1) > 0.001
+                or selection not in {'over', 'under', 'none'}
+            ):
+                return empty_market_forecast()
+            seen_lines.add(line)
+            if selection == 'none':
+                if selection_probability is not None:
+                    return empty_market_forecast()
+                continue
+            probability = _finite_nonnegative(selection_probability)
+            expected_probability = over if selection == 'over' else under
+            if (
+                probability is None
+                or probability > 1
+                or abs(probability - expected_probability) > 0.001
+            ):
+                return empty_market_forecast()
+    return dict(value)
 
 
 def _poisson_cdf(maximum: int, mean: float) -> float:
@@ -33,6 +126,60 @@ def _poisson_cdf(maximum: int, mean: float) -> float:
 
 def _over_probability(mean: float, line: float) -> float:
     return 1.0 - _poisson_cdf(math.floor(line), mean)
+
+
+def _market_line(
+    *,
+    line: float,
+    over_probability: float,
+) -> dict[str, Any]:
+    over = round(min(1.0, max(0.0, over_probability)), 4)
+    under = round(1.0 - over, 4)
+    if over_probability >= MARKET_RECOMMENDATION_PROBABILITY:
+        selection = 'over'
+        selection_probability: float | None = over
+    elif 1.0 - over_probability >= MARKET_RECOMMENDATION_PROBABILITY:
+        selection = 'under'
+        selection_probability = under
+    else:
+        selection = 'none'
+        selection_probability = None
+    return {
+        'line': line,
+        'over_probability': over,
+        'under_probability': under,
+        'selection': selection,
+        'selection_probability': selection_probability,
+    }
+
+
+def _relevant_half_lines(mean: float, *, step: int) -> list[float]:
+    """Return five nonnegative half-lines centred as closely as possible."""
+
+    center = math.floor(mean) + 0.5
+    start = center - (2 * step)
+    while start < 0.5:
+        start += step
+    return [round(start + (index * step), 1) for index in range(5)]
+
+
+def _market_lines(
+    mean: float,
+    lines: list[float] | tuple[float, ...],
+    *,
+    stored_probabilities: Mapping[float, float] | None = None,
+) -> list[dict[str, Any]]:
+    stored_probabilities = stored_probabilities or {}
+    return [
+        _market_line(
+            line=line,
+            over_probability=stored_probabilities.get(
+                line,
+                _over_probability(mean, line),
+            ),
+        )
+        for line in lines
+    ]
 
 
 def _poisson_quantile(mean: float, probability: float) -> int:
@@ -219,8 +366,8 @@ def build_probable_forecast(
 ) -> list[dict[str, Any]]:
     """Build only model-backed markets that the app is allowed to publish.
 
-    This function is deterministic and performs no provider or AI calls. The
-    AI may later rank these server-created picks, but it cannot create values.
+    This function is deterministic and performs no provider or generative-AI
+    calls. Every published value comes from the stored statistical model.
     """
 
     expected = prediction.get('expected')
@@ -427,3 +574,141 @@ def build_probable_forecast(
         'shots_on_target': 6,
     }
     return sorted(picks, key=lambda pick: order[pick['category']])
+
+
+def build_market_forecast(
+    prediction: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build deterministic over/under lines from evidenced expected counts.
+
+    The returned probabilities describe the statistical side with more support;
+    they do not compare against bookmaker odds or claim positive betting value.
+    """
+
+    expected = prediction.get('expected')
+    expected = expected if isinstance(expected, Mapping) else {}
+    metadata = prediction.get('model_metadata')
+    metadata = metadata if isinstance(metadata, Mapping) else {}
+    known_sides = _known_sides(metadata)
+    low_quality = (
+        str(metadata.get('confidence') or '').lower() == 'low'
+        or known_sides is not None
+    )
+    confidence = 'low' if low_quality else 'medium'
+    league_id = int(prediction.get('league_id') or 0)
+    official_match = league_id != FRIENDLY_LEAGUE_ID
+    markets: list[dict[str, Any]] = []
+
+    if known_sides is None:
+        home_goals = _expected_value(
+            expected,
+            'home_goals',
+            known_sides=known_sides,
+        )
+        away_goals = _expected_value(
+            expected,
+            'away_goals',
+            known_sides=known_sides,
+        )
+        if home_goals is not None and away_goals is not None:
+            total_goals = home_goals + away_goals
+            stored_goal_probabilities: dict[float, float] = {}
+            raw_goal_lines = metadata.get('goal_lines')
+            if isinstance(raw_goal_lines, list):
+                for row in raw_goal_lines:
+                    if not isinstance(row, Mapping):
+                        continue
+                    line = _finite_nonnegative(row.get('line'))
+                    probability = _finite_nonnegative(row.get('probability'))
+                    if (
+                        line in GOAL_TOTAL_LINES
+                        and probability is not None
+                        and probability <= 1
+                        and line not in stored_goal_probabilities
+                    ):
+                        stored_goal_probabilities[line] = probability
+            markets.append({
+                'category': 'goals',
+                'title': 'Goles totales',
+                'scope': 'match_total',
+                'expected_total': round(total_goals, 3),
+                'confidence': confidence,
+                'lines': _market_lines(
+                    total_goals,
+                    GOAL_TOTAL_LINES,
+                    stored_probabilities=stored_goal_probabilities,
+                ),
+            })
+
+    market_specs = (
+        (
+            'corners',
+            'Córners totales',
+            'corners',
+            'home_corners',
+            'away_corners',
+            1,
+        ),
+        (
+            'yellow_cards',
+            'Tarjetas amarillas totales',
+            'yellow_cards',
+            'home_yellow_cards',
+            'away_yellow_cards',
+            1,
+        ),
+        (
+            'shots',
+            'Remates totales',
+            'shots',
+            'home_shots',
+            'away_shots',
+            2,
+        ),
+        (
+            'shots_on_target',
+            'Remates al arco totales',
+            'shots_on_target',
+            'home_shots_on_target',
+            'away_shots_on_target',
+            1,
+        ),
+    )
+    for category, title, metric, home_key, away_key, line_step in market_specs:
+        if category == 'yellow_cards' and not official_match:
+            continue
+        home_value = _market_value(
+            expected,
+            metadata,
+            home_key,
+            metric=metric,
+            known_sides=known_sides,
+        )
+        away_value = _market_value(
+            expected,
+            metadata,
+            away_key,
+            metric=metric,
+            known_sides=known_sides,
+        )
+        if home_value is None or away_value is None:
+            continue
+        expected_total = home_value + away_value
+        relevant_lines = _relevant_half_lines(
+            expected_total,
+            step=line_step,
+        )
+        markets.append({
+            'category': category,
+            'title': title,
+            'scope': 'match_total',
+            'expected_total': round(expected_total, 3),
+            'confidence': confidence,
+            'lines': _market_lines(expected_total, relevant_lines),
+        })
+
+    return {
+        'version': MARKET_FORECAST_VERSION,
+        'method': MARKET_FORECAST_METHOD,
+        'markets': markets,
+    }

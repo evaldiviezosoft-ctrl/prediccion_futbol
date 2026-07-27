@@ -41,23 +41,9 @@ def test_secret_values_are_masked_in_settings_representation():
     assert secret not in repr(settings)
 
 
-def test_openai_defaults_match_the_configured_quality_first_contract():
-    key = 'sk-test-only-012345678901234567890'
-    settings = Settings(_env_file=None, openai_api_key=key)
+def test_postmatch_evaluation_defaults_are_bounded():
+    settings = Settings(_env_file=None)
 
-    assert settings.openai_configured is True
-    assert settings.require_openai_api_key() == key
-    assert settings.openai_model == 'gpt-5.6-sol'
-    assert settings.openai_reasoning_effort == 'high'
-    assert settings.openai_max_output_tokens == 6_000
-    assert settings.ai_calibration_max_per_cycle == 5
-    assert key not in repr(settings)
-
-
-def test_placeholder_openai_key_does_not_enable_optional_calibration():
-    settings = Settings(
-        _env_file=None,
-        openai_api_key='REEMPLAZAR_SOLO_BACKEND',
-    )
-
-    assert settings.openai_configured is False
+    assert settings.postmatch_lookback_days == 7
+    assert settings.postmatch_max_matches == 100
+    assert settings.postmatch_poll_interval_minutes == 30

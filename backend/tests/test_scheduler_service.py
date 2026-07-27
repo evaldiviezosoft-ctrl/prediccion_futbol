@@ -53,6 +53,9 @@ def _configured_settings(**overrides):
         'scheduler_daily_hour': 0,
         'scheduler_daily_minute': 5,
         'scheduler_prediction_horizon_days': 14,
+        'postmatch_lookback_days': 7,
+        'postmatch_max_matches': 100,
+        'postmatch_poll_interval_minutes': 30,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -71,7 +74,7 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
     assert scheduler is not None
     assert scheduler.running is True
     assert scheduler.timezone == ZoneInfo('America/Lima')
-    assert len(scheduler.jobs) == 2
+    assert len(scheduler.jobs) == 3
     function, job_options = scheduler.jobs[0]
     assert function is scheduler_service._scheduled_cycle
     assert job_options['id'] == 'sync-and-predict'
@@ -95,6 +98,16 @@ def test_daily_scheduler_runs_immediately_and_then_uses_lima_cron(monkeypatch):
     assert lineup_options['coalesce'] is True
     assert lineup_options['max_instances'] == 1
     assert lineup_options['replace_existing'] is True
+    postmatch_function, postmatch_options = scheduler.jobs[2]
+    assert postmatch_function is scheduler_service._scheduled_postmatch_cycle
+    assert postmatch_options['id'] == 'evaluate-postmatch-results'
+    assert postmatch_options['coalesce'] is True
+    assert postmatch_options['max_instances'] == 1
+    assert postmatch_options['replace_existing'] is True
+    assert postmatch_options['trigger'].interval == timedelta(minutes=30)
+    immediate_postmatch_run = postmatch_options['next_run_time']
+    assert isinstance(immediate_postmatch_run, datetime)
+    assert immediate_postmatch_run.tzinfo == ZoneInfo('America/Lima')
 
 
 def test_daily_scheduler_waits_for_cron_by_default(monkeypatch):
@@ -225,7 +238,59 @@ def test_scheduled_cycle_contains_db_only_failure_after_successful_sync(
     assert 'private database details' not in caplog.text
 
 
-def test_lineup_cycle_filters_to_predictions_and_calibrates_only_confirmed(
+def test_scheduled_postmatch_cycle_uses_configured_limits(monkeypatch, caplog):
+    calls: list[dict[str, int]] = []
+
+    async def fake_postmatch(**kwargs):
+        calls.append(kwargs)
+        return {
+            'candidates': 3,
+            'details_refreshed': 2,
+            'evaluated': 1,
+            'partial': 1,
+            'void': 0,
+            'legacy_unscored': 1,
+        }
+
+    monkeypatch.setattr(
+        scheduler_service,
+        'sync_and_evaluate_published_predictions',
+        fake_postmatch,
+    )
+    monkeypatch.setattr(
+        scheduler_service,
+        'get_settings',
+        lambda: _configured_settings(
+            postmatch_lookback_days=5,
+        ),
+    )
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_postmatch_cycle())
+
+    assert calls == [{'lookback_days': 5, 'max_matches': 100}]
+    assert 'candidates=3 refreshed=2 evaluated=1 partial=1' in caplog.text
+
+
+def test_scheduled_postmatch_cycle_contains_failure_details(monkeypatch, caplog):
+    async def failing_postmatch(**_kwargs):
+        raise RuntimeError('private provider details')
+
+    monkeypatch.setattr(
+        scheduler_service,
+        'sync_and_evaluate_published_predictions',
+        failing_postmatch,
+    )
+    monkeypatch.setattr(scheduler_service, 'get_settings', _configured_settings)
+    caplog.set_level(logging.INFO, logger=scheduler_service.__name__)
+
+    asyncio.run(scheduler_service._scheduled_postmatch_cycle())
+
+    assert 'Scheduled post-match evaluation failed: RuntimeError' in caplog.text
+    assert 'private provider details' not in caplog.text
+
+
+def test_lineup_cycle_filters_to_predictions_and_downloads_only_confirmed_window(
     monkeypatch,
 ):
     calls: dict[str, object] = {}
@@ -260,10 +325,7 @@ def test_lineup_cycle_filters_to_predictions_and_calibrates_only_confirmed(
                 skipped=0,
             )
 
-    async def fake_refresh(fixture_id, **kwargs):
-        calls['refresh'] = (fixture_id, kwargs)
-
-    settings = _configured_settings(openai_configured=True)
+    settings = _configured_settings()
     repository = Repository()
     database = object()
     monkeypatch.setattr(scheduler_service, 'get_settings', lambda: settings)
@@ -279,12 +341,6 @@ def test_lineup_cycle_filters_to_predictions_and_calibrates_only_confirmed(
         'OptionalFixtureSyncService',
         OptionalService,
     )
-    monkeypatch.setattr(
-        scheduler_service,
-        'refresh_ai_calibration',
-        fake_refresh,
-    )
-
     before = datetime.now(timezone.utc)
     asyncio.run(scheduler_service._scheduled_lineup_cycle())
     after = datetime.now(timezone.utc)
@@ -296,11 +352,6 @@ def test_lineup_cycle_filters_to_predictions_and_calibrates_only_confirmed(
     window = calls['window']
     assert before <= window['starts_at'] <= after
     assert window['ends_at'] - window['starts_at'] == timedelta(minutes=90)
-    fixture_id, refresh_kwargs = calls['refresh']
-    assert fixture_id == 22
-    assert refresh_kwargs['repository'] is repository
-    assert refresh_kwargs['db_client'] is database
-    assert refresh_kwargs['settings'] is settings
 
 
 def test_start_scheduler_reuses_the_single_running_instance(monkeypatch):
@@ -343,6 +394,15 @@ def test_db_only_prediction_horizon_rejects_invalid_values(invalid_value):
         Settings(
             _env_file=None,
             scheduler_prediction_horizon_days=invalid_value,
+        )
+
+
+@pytest.mark.parametrize('invalid_value', (9, 121))
+def test_postmatch_poll_interval_rejects_invalid_values(invalid_value):
+    with pytest.raises(ValidationError):
+        Settings(
+            _env_file=None,
+            postmatch_poll_interval_minutes=invalid_value,
         )
 
 

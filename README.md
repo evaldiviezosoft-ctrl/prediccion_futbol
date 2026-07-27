@@ -21,7 +21,8 @@ FastAPI (backend/)
 Supabase
   ├─ leagues y fixtures
   ├─ predictions publicadas
-  └─ prediction_versions (historial)
+  ├─ prediction_versions (historial)
+  └─ prediction_evaluations y prediction_market_results (aciertos)
 ```
 
 Supabase no ejecuta los modelos. La base de datos guarda datos operativos y
@@ -30,6 +31,12 @@ resultados; FastAPI calcula y publica la predicción. Los cinco modelos europeos
 competiciones sudamericanas usan inicialmente un baseline Poisson/
 Empirical-Bayes calculado con el historial almacenado. Ningún modelo se mueve a
 Supabase.
+
+Los pronósticos de mercado también se calculan en FastAPI, sin IA generativa:
+líneas Más/Menos para goles, córners, tarjetas, remates y remates al arco. Cada
+versión queda congelada antes del inicio y el ciclo postpartido consulta solo
+los fixtures pronosticados, guarda sus estadísticas finales y liquida cada
+selección como acertada, fallada, nula o pendiente.
 
 ## Probar la interfaz sin claves
 
@@ -146,16 +153,21 @@ ENABLE_SCHEDULER=true
 SCHEDULER_RUN_ON_STARTUP=false
 SCHEDULER_HORIZON_DAYS=7
 SCHEDULER_PREDICTION_HORIZON_DAYS=14
+POSTMATCH_LOOKBACK_DAYS=7
+POSTMATCH_MAX_MATCHES=100
+POSTMATCH_POLL_INTERVAL_MINUTES=30
 SCHEDULER_DAILY_HOUR=0
 SCHEDULER_DAILY_MINUTE=5
 DEFAULT_TIMEZONE=America/Lima
 ```
 
-De forma predeterminada, arrancar o reiniciar FastAPI no consume cuota: el
-primer ciclo espera hasta las `00:05` de Lima y luego se ejecuta una vez al día.
-`SCHEDULER_RUN_ON_STARTUP=true` habilita una ejecución inmediata de manera
-explícita. El programador reutiliza una sola instancia y cada trabajo admite
-como máximo una ejecución simultánea. Los límites
+De forma predeterminada, el ciclo de calendario y predicciones espera hasta las
+`00:05` de Lima y luego se ejecuta una vez al día.
+`SCHEDULER_RUN_ON_STARTUP=true` habilita una ejecución inmediata de ese ciclo.
+El cierre pospartido se inicia con el backend y se repite cada
+`POSTMATCH_POLL_INTERVAL_MINUTES`; solo consulta si encuentra partidos
+pronosticados cuyo inicio ya pasó. El programador reutiliza una sola instancia
+y cada trabajo admite como máximo una ejecución simultánea. Los límites
 `API_DAILY_SAFETY_RESERVE` y `API_MAX_REQUESTS_PER_RUN` siguen protegiendo la
 cuota gratuita.
 
@@ -163,6 +175,16 @@ cuota gratuita.
 `SCHEDULER_PREDICTION_HORIZON_DAYS` controla por separado el catch-up de
 predicciones desde partidos ya guardados; esta segunda fase no consume cuota
 del proveedor y procesa hasta 100 partidos por ciclo.
+
+`POSTMATCH_LOOKBACK_DAYS` y `POSTMATCH_MAX_MATCHES` controlan el cierre de
+resultados. Esta fase revisa como máximo 100 partidos ya pronosticados,
+actualiza primero el marcador mediante el calendario de la fecha UTC vigente e
+intenta descargar sus estadísticas detalladas en lotes de 20, sin consultar
+una liga completa. Cada fixture detallado se intenta como máximo una vez por
+día UTC para proteger la cuota.
+Si el plan de API-Football bloquea córners, tarjetas o remates, esos mercados
+quedan `pending`: los goles sí se califican con el marcador y una estadística
+ausente nunca se registra como fallo.
 
 El programador vive dentro del proceso FastAPI: si el equipo o servidor está
 apagado, no puede sincronizar. En un despliegue con varias réplicas se debe
@@ -175,8 +197,9 @@ disponible para recorrer la interfaz sin depender del proveedor.
 
 ## Actualizar el modelo
 
-El aprendizaje continuo todavía no está implementado. Supabase aporta datos
-normalizados, pero no entrena modelos. Sudamérica ya puede publicar una
+El reentrenamiento automático todavía no está implementado. Supabase aporta
+datos normalizados y ahora mide los aciertos por mercado y línea, pero no
+modifica un modelo por sí solo. Sudamérica ya puede publicar una
 estimación estadística inicial desde los resultados históricos guardados, sin
 consumir API-Football:
 

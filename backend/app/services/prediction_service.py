@@ -43,6 +43,7 @@ from app.services.fixture_service import (
 )
 from app.services.model_service import predict
 from app.services.odds_parser import parse_opening_odds
+from app.services.probable_forecast_service import build_market_forecast
 from app.services.scorer_service import possible_scorers
 from app.services.supabase_repository import SupabaseRepository
 from app.services.team_history_profile import build_team_history_profile
@@ -71,6 +72,7 @@ _PREDICTION_SEMANTIC_FIELDS = (
     'possible_scorers',
     'model_metadata',
     'features_snapshot',
+    'market_forecast',
     'published',
 )
 
@@ -142,6 +144,10 @@ def _persist_prediction(
     preserve_if_unchanged: bool = False,
 ) -> dict[str, Any]:
     try:
+        record = {
+            **record,
+            'market_forecast': build_market_forecast(record),
+        }
         stored: dict[str, Any] | None = None
         if preserve_if_unchanged or record.get('lineups_confirmed') is False:
             response = (
@@ -155,7 +161,7 @@ def _persist_prediction(
             stored = dict(rows[0]) if rows else None
         # Confirmation is monotonic for a fixture. A later statistical refresh
         # or a transient empty provider response must never revert the final
-        # lineup state and accidentally unlock another AI recalibration.
+        # lineup state.
         if stored and stored.get('lineups_confirmed') is True:
             record = {
                 **record,

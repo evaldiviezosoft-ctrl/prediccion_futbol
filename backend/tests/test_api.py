@@ -7,6 +7,7 @@ from app.core.config import Settings
 from app.main import app
 from app.routes import admin, dependencies, fixtures, health, predictions
 from app.services.api_football import ApiFootballError
+from app.services.probable_forecast_service import build_market_forecast
 
 
 VALID_ADMIN_TOKEN = 'valid_admin_token_0123456789'
@@ -177,7 +178,7 @@ class MissingPredictionDatabase:
 
 class PublishedPredictionQuery(MissingPredictionQuery):
     def execute(self):
-        return SimpleNamespace(data={
+        payload = {
             'fixture_id': 1492292,
             'published': True,
             'home_team_id': 177,
@@ -195,7 +196,9 @@ class PublishedPredictionQuery(MissingPredictionQuery):
                     {'player': 'Jugador A', 'team': 'Flamengo', 'probability': 0.2}
                 ],
             },
-        })
+        }
+        payload['market_forecast'] = build_market_forecast(payload)
+        return SimpleNamespace(data=payload)
 
 
 class PublishedPredictionDatabase(UpcomingDatabase):
@@ -448,9 +451,40 @@ def test_published_prediction_contract_returns_model_metadata(monkeypatch):
         'probability': 0.73,
         'confidence': 'medium',
     }
+    market_forecast = response.json()['market_forecast']
+    assert market_forecast['version'] == 'deterministic_lines_v1'
+    assert [market['category'] for market in market_forecast['markets']] == [
+        'goals',
+    ]
+    assert market_forecast['markets'][0]['title'] == 'Goles totales'
+    assert len(market_forecast['markets'][0]['lines']) == 5
+    one_point_five = market_forecast['markets'][0]['lines'][1]
+    assert one_point_five['line'] == 1.5
+    assert one_point_five['selection'] == 'over'
+    assert one_point_five['selection_probability'] == 0.73
     assert response.json()['home_team_country'] == 'Brazil'
     assert response.json()['away_team_country'] == 'Brazil'
     assert 'likely_scores' not in response.json()
+
+
+def test_prediction_performance_endpoint_returns_stored_outcomes(monkeypatch):
+    class Repository:
+        async def prediction_performance_summary(self):
+            return {
+                'evaluated_fixtures': 2,
+                'scored_selections': 8,
+                'correct_selections': 6,
+                'accuracy': 0.75,
+                'by_market': {},
+            }
+
+    monkeypatch.setattr(predictions, 'SupabaseRepository', Repository)
+
+    with TestClient(app) as client:
+        response = client.get('/predictions/performance/summary')
+
+    assert response.status_code == 200
+    assert response.json()['accuracy'] == 0.75
 
 
 def test_admin_endpoint_is_disabled_when_token_is_missing_or_placeholder(monkeypatch):
@@ -496,6 +530,30 @@ def test_admin_endpoint_rejects_wrong_token_and_runs_with_valid_token(monkeypatc
     assert valid.status_code == 200
     assert valid.json() == job_result
     mocked_job.assert_awaited_once_with(horizon_days=2, max_matches=1, timezone_name=None)
+
+
+def test_admin_postmatch_defaults_to_one_hundred_and_rejects_more(monkeypatch):
+    monkeypatch.setattr(dependencies, 'get_settings', lambda: settings_with_admin())
+    mocked_job = AsyncMock(return_value={'candidates': 0})
+    monkeypatch.setattr(
+        admin,
+        'sync_and_evaluate_published_predictions',
+        mocked_job,
+    )
+
+    with TestClient(app) as client:
+        valid = client.post(
+            '/admin/jobs/evaluate-postmatch',
+            headers={'X-Admin-Token': VALID_ADMIN_TOKEN},
+        )
+        invalid = client.post(
+            '/admin/jobs/evaluate-postmatch?max_matches=101',
+            headers={'X-Admin-Token': VALID_ADMIN_TOKEN},
+        )
+
+    assert valid.status_code == 200
+    assert invalid.status_code == 422
+    mocked_job.assert_awaited_once_with(lookback_days=7, max_matches=100)
 
 
 def test_provider_errors_are_mapped_without_exposing_internal_details(monkeypatch):
